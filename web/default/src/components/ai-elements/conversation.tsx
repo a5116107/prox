@@ -1,0 +1,80 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+'use client'
+
+import { type ComponentProps, useCallback } from 'react'
+import { ArrowDownIcon } from 'lucide-react'
+import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
+
+export type ConversationProps = ComponentProps<typeof StickToBottom>
+
+export const Conversation = ({ className, ...props }: ConversationProps) => (
+  <StickToBottom
+    className={cn('relative flex-1 overflow-y-auto', className)}
+    initial='smooth'
+    resize='smooth'
+    role='log'
+    {...props}
+  />
+)
+
+export type ConversationContentProps = ComponentProps<
+  typeof StickToBottom.Content
+>
+
+export const ConversationContent = ({
+  className,
+  ...props
+}: ConversationContentProps) => (
+  <StickToBottom.Content className={cn('p-4', className)} {...props} />
+)
+
+export type ConversationScrollButtonProps = ComponentProps<typeof Button>
+
+export const ConversationScrollButton = ({
+  className,
+  ...props
+}: ConversationScrollButtonProps) => {
+  const { isAtBottom, scrollToBottom } = useStickToBottomContext()
+
+  const handleScrollToBottom = useCallback(() => {
+    scrollToBottom()
+  }, [scrollToBottom])
+
+  return (
+    !isAtBottom && (
+      <Button
+        className={cn(
+          'absolute bottom-4 left-[50%] translate-x-[-50%]',
+          className
+        )}
+        onClick={handleScrollToBottom}
+        size='icon'
+        type='button'
+        variant='outline'
+        aria-label='Scroll to bottom'
+        {...props}
+      >
+        <ArrowDownIcon className='size-4' aria-hidden='true' />
+      </Button>
+    )
+  )
+}

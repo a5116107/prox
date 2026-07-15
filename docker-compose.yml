@@ -1,0 +1,123 @@
+name: prox-dev
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: newapi
+      POSTGRES_PASSWORD: "${PG_PASS:?set PG_PASS in .env}"
+      POSTGRES_DB: new-api
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    networks: [prox]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newapi -d new-api"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - "${REDIS_PASS:?set REDIS_PASS in .env}"
+    networks: [prox]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASS:?set REDIS_PASS in .env}"
+
+  new-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: prox-new-api:dev
+    restart: unless-stopped
+    command: ["--log-dir", "/app/logs"]
+    environment:
+      SQL_DSN: "host=postgres port=5432 user=newapi password=${PG_PASS} dbname=new-api sslmode=disable"
+      REDIS_CONN_STRING: "redis://:${REDIS_PASS}@redis:6379"
+      SESSION_SECRET: "${SESSION_SECRET:?set SESSION_SECRET in .env}"
+      CRYPTO_SECRET: "${CRYPTO_SECRET:?set CRYPTO_SECRET in .env}"
+      SESSION_COOKIE_NAME: "${SESSION_COOKIE_NAME:-prox_session}"
+      SESSION_COOKIE_DOMAIN: "${SESSION_COOKIE_DOMAIN:-}"
+      GAME_ADMIN_UPSTREAM: http://hermes-adapter:18181
+      GAME_ADMIN_KEY: "${HERMES_SHARED_KEY:?set HERMES_SHARED_KEY in .env}"
+      TZ: Asia/Shanghai
+      ERROR_LOG_ENABLED: "true"
+      BATCH_UPDATE_ENABLED: "true"
+      NODE_NAME: prox-dev
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [prox]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/status | grep -q '\"success\":true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  hermes-adapter:
+    image: python:3.11-slim
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "adapter.py"]
+    environment:
+      SITE_ID: "${COMMUNITY_SITE_ID:-prox}"
+      SITE_NAME: "${SITE_NAME:-prox}"
+      BOT_PLATFORM: "${BOT_PLATFORM:-qq}"
+      HERMES_ADAPTER_HOST: 0.0.0.0
+      HERMES_ADAPTER_PORT: "18181"
+      HERMES_ADAPTER_KEY: "${HERMES_SHARED_KEY:?set HERMES_SHARED_KEY in .env}"
+      GAME_ADMIN_KEY: "${HERMES_SHARED_KEY:?set HERMES_SHARED_KEY in .env}"
+      CHATOPS_WEBHOOK_SECRET: "${CHATOPS_WEBHOOK_SECRET:?set CHATOPS_WEBHOOK_SECRET in .env}"
+      NEWAPI_INTERNAL_BASE_URL: http://new-api:3000
+      OPENAI_BASE_URL: "${HERMES_OPENAI_BASE_URL:-http://new-api:3000/v1}"
+      OPENAI_API_KEY: "${HERMES_OPENAI_API_KEY:-}"
+      HERMES_MODEL: "${HERMES_MODEL:-}"
+      ONEBOT_URL: "${ONEBOT_URL:-http://host.docker.internal:13000}"
+      ONEBOT_TOKEN: "${ONEBOT_TOKEN:-}"
+      ONEBOT_WEBHOOK_SECRET: "${ONEBOT_WEBHOOK_SECRET:-}"
+      HERMES_GAME_ALLOW_PLUGIN_DEFAULTS: "${HERMES_GAME_ALLOW_PLUGIN_DEFAULTS:-true}"
+      HERMES_STATE_DIR: /var/lib/prox-hermes
+      HERMES_GAME_CONFIG_CACHE: /var/lib/prox-hermes/game_config.json
+      HERMES_LEARNING_STORE: /var/lib/prox-hermes/learning_store.json
+    volumes:
+      - ./integrations/newapi-hermes-adapter:/app
+      - hermes-state:/var/lib/prox-hermes
+    ports:
+      - "127.0.0.1:18181:18181"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      new-api:
+        condition: service_healthy
+    networks: [prox]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18181/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+networks:
+  prox:
+    driver: bridge
+
+volumes:
+  hermes-state:

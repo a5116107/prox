@@ -1,0 +1,36 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "API-key masking fixture in the log redaction implementation"
+condition = "AND"
+rules = ["gcp-api-key"]
+paths = ['''^common/str\.go$''']
+
+[[allowlists]]
+description = "Synthetic token values used by response-masking tests"
+condition = "AND"
+rules = ["generic-api-key"]
+paths = ['''^controller/token_test\.go$''']
+
+[[allowlists]]
+description = "Stable API compatibility version header, not a credential"
+condition = "AND"
+rules = ["generic-api-key"]
+paths = ['''^middleware/auth\.go$''']
+regexTarget = "secret"
+regexes = ['''^864b7076dbcd0a3c01b5520316720ebf$''']
+
+[[allowlists]]
+description = "Documented Jimeng request identifiers"
+condition = "AND"
+rules = ["generic-api-key"]
+paths = ['''^relay/channel/task/jimeng/adaptor\.go$''']
+regexTarget = "secret"
+regexes = ['''^jimeng_(?:vgfm_t2v_l20|v30_pro|ti2v_v30_pro)$''']
+
+[[allowlists]]
+description = "PEM delimiters used by the Vertex service-account parser"
+condition = "AND"
+rules = ["private-key"]
+paths = ['''^relay/channel/vertex/service_account\.go$''']

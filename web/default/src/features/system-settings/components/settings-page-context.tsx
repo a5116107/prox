@@ -1,0 +1,179 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import {
+  createContext,
+  useContext,
+  type ComponentProps,
+  type ReactNode,
+  type RefObject,
+} from 'react'
+import { RotateCcw, Save } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { useTranslation } from 'react-i18next'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
+
+type SettingsPageContextValue = {
+  actionsContainer: HTMLDivElement | null
+  titleStatusContainer: HTMLSpanElement | null
+  suppressSectionHeader: boolean
+}
+
+const SettingsPageContext = createContext<SettingsPageContextValue>({
+  actionsContainer: null,
+  titleStatusContainer: null,
+  suppressSectionHeader: false,
+})
+
+type SettingsPageProviderProps = {
+  actionsContainer: HTMLDivElement | null
+  titleStatusContainer?: HTMLSpanElement | null
+  children: ReactNode
+  suppressSectionHeader?: boolean
+}
+
+export function SettingsPageProvider(props: SettingsPageProviderProps) {
+  return (
+    <SettingsPageContext.Provider
+      value={{
+        actionsContainer: props.actionsContainer,
+        titleStatusContainer: props.titleStatusContainer ?? null,
+        suppressSectionHeader: props.suppressSectionHeader ?? true,
+      }}
+    >
+      {props.children}
+    </SettingsPageContext.Provider>
+  )
+}
+
+// The context hook is intentionally colocated with its provider contract.
+// eslint-disable-next-line react-refresh/only-export-components
+export function useSuppressSettingsSectionHeader() {
+  return useContext(SettingsPageContext).suppressSectionHeader
+}
+
+type SettingsPageTitleStatusPortalProps = {
+  children: ReactNode
+}
+
+export function SettingsPageTitleStatusPortal(
+  props: SettingsPageTitleStatusPortalProps
+) {
+  const { titleStatusContainer } = useContext(SettingsPageContext)
+
+  if (!titleStatusContainer) return null
+
+  return createPortal(props.children, titleStatusContainer)
+}
+
+type SettingsPageActionsPortalProps = {
+  children: ReactNode
+}
+
+export function SettingsPageActionsPortal(
+  props: SettingsPageActionsPortalProps
+) {
+  const { actionsContainer } = useContext(SettingsPageContext)
+
+  if (!actionsContainer) return null
+
+  return createPortal(
+    <div className='flex flex-wrap items-center justify-end gap-2'>
+      {props.children}
+    </div>,
+    actionsContainer
+  )
+}
+
+type SettingsPageFormActionsProps = {
+  onSave: () => void
+  onReset?: () => void
+  isSaving?: boolean
+  isSaveDisabled?: boolean
+  isResetDisabled?: boolean
+  saveLabel?: string
+  savingLabel?: string
+  resetLabel?: string
+  resetVariant?: ComponentProps<typeof Button>['variant']
+  saveButtonRef?: RefObject<HTMLButtonElement | null>
+  inline?: boolean
+  className?: string
+}
+
+export function SettingsPageFormActions({
+  onSave,
+  onReset,
+  isSaving,
+  isSaveDisabled,
+  isResetDisabled,
+  saveLabel: idleSaveLabel,
+  savingLabel,
+  resetLabel,
+  resetVariant,
+  saveButtonRef,
+  inline,
+  className,
+}: SettingsPageFormActionsProps) {
+  const { t } = useTranslation()
+  const saveLabel = isSaving
+    ? (savingLabel ?? 'Saving...')
+    : (idleSaveLabel ?? 'Save Changes')
+
+  const actions = (
+    <>
+      {onReset && (
+        <Button
+          type='button'
+          size='sm'
+          variant={resetVariant ?? 'outline'}
+          onClick={onReset}
+          disabled={isResetDisabled || isSaving}
+        >
+          <RotateCcw data-icon='inline-start' />
+          <span>{t(resetLabel ?? 'Reset')}</span>
+        </Button>
+      )}
+      <Button
+        ref={saveButtonRef}
+        type='button'
+        size='sm'
+        onClick={onSave}
+        disabled={isSaving || isSaveDisabled}
+      >
+        <Save data-icon='inline-start' />
+        <span>{t(saveLabel)}</span>
+      </Button>
+    </>
+  )
+
+  if (inline) {
+    return (
+      <div
+        className={cn(
+          'flex flex-wrap items-center justify-end gap-2',
+          className
+        )}
+      >
+        {actions}
+      </div>
+    )
+  }
+
+  return <SettingsPageActionsPortal>{actions}</SettingsPageActionsPortal>
+}

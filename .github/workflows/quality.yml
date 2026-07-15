@@ -1,0 +1,117 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: bash scripts/test/prepare-embed-assets.sh
+      - run: go test ./... -count=1 -timeout=15m
+
+  quiz-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: prox_test
+          POSTGRES_PASSWORD: prox_test
+          POSTGRES_DB: prox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U prox_test -d prox_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      QUIZ_POSTGRES_TEST_DSN: host=127.0.0.1 port=5432 user=prox_test password=prox_test dbname=prox_test sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./service -run '^TestQuizDrawConcurrentPostgres$' -count=1 -timeout=3m
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r integrations/newapi-hermes-adapter/requirements.txt -r integrations/newapi-hermes-adapter/requirements-dev.txt
+      - run: ruff format --check scripts/quiz/import_seed.py integrations/newapi-hermes-adapter
+      - run: python -m pytest integrations/newapi-hermes-adapter/tests -q
+      - run: python -m py_compile scripts/quiz/import_seed.py integrations/newapi-hermes-adapter/*.py integrations/newapi-hermes-adapter/game_plugins/*.py
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.5'
+      - run: bun install --frozen-lockfile
+        working-directory: web
+      - run: bun run test
+        working-directory: web/default
+      - run: bun run typecheck
+        working-directory: web/default
+      - run: bun run lint
+        working-directory: web/default
+      - run: bun run format:check
+        working-directory: web/default
+      - run: node scripts/sync-i18n.mjs check --json
+        working-directory: web/default
+      - run: bun run build
+        working-directory: web/default
+      - run: bun run lint
+        working-directory: web/classic
+      - run: bun run eslint
+        working-directory: web/classic
+      - run: bun run build
+        working-directory: web/classic
+
+  delivery-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell scripts
+        run: shellcheck scripts/deploy/*.sh scripts/test/*.sh
+      - name: Validate production Compose
+        run: docker compose --env-file .env.deploy.example -f compose.prod.yml config --quiet
+      - name: Validate development Compose
+        env:
+          PG_PASS: test-password
+          REDIS_PASS: test-password
+          SESSION_SECRET: test-session-secret
+          CRYPTO_SECRET: test-crypto-secret
+          HERMES_SHARED_KEY: test-hermes-secret
+          CHATOPS_WEBHOOK_SECRET: test-chatops-secret
+        run: docker compose -f docker-compose.yml config --quiet
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用文档 / Documentation
+    url: https://github.com/a5116107/prox/tree/main/docs
+    about: 提交 issue 前请先查阅 prox 的开发、部署与排障文档。
+  - name: 使用问题 / Usage Questions
+    url: https://github.com/a5116107/prox/issues
+    about: 使用、配置与接入问题请搜索现有 issue 后再提交。

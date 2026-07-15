@@ -1,0 +1,155 @@
+name: prox-prod
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: new-api-pg
+    restart: always
+    environment:
+      POSTGRES_USER: newapi
+      POSTGRES_PASSWORD: "${PG_PASS:?set PG_PASS in .env.deploy}"
+      POSTGRES_DB: new-api
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    networks: [new-api-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newapi -d new-api"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: new-api-redis
+    restart: always
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - "${REDIS_PASS:?set REDIS_PASS in .env.deploy}"
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASS:?set REDIS_PASS in .env.deploy}"
+    networks: [new-api-network]
+
+  new-api:
+    image: "${NEWAPI_IMAGE:?set NEWAPI_IMAGE in .env.deploy}"
+    container_name: new-api
+    restart: always
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    command: ["--log-dir", "/app/logs"]
+    environment:
+      SQL_DSN: "host=postgres port=5432 user=newapi password=${PG_PASS} dbname=new-api sslmode=disable"
+      REDIS_CONN_STRING: "redis://:${REDIS_PASS}@redis:6379"
+      TZ: Asia/Shanghai
+      ERROR_LOG_ENABLED: "true"
+      BATCH_UPDATE_ENABLED: "true"
+      NODE_NAME: "${NODE_NAME:-prox-prod-main}"
+      SESSION_SECRET: "${SESSION_SECRET:?set SESSION_SECRET in .env.deploy}"
+      SESSION_COOKIE_NAME: "${SESSION_COOKIE_NAME:-prox_session}"
+      SESSION_COOKIE_DOMAIN: "${SESSION_COOKIE_DOMAIN:?set SESSION_COOKIE_DOMAIN in .env.deploy}"
+      CRYPTO_SECRET: "${CRYPTO_SECRET:?set CRYPTO_SECRET in .env.deploy}"
+      GAME_ADMIN_UPSTREAM: "${HERMES_ADAPTER_URL:-http://host.docker.internal:18181}"
+      GAME_ADMIN_KEY: "${HERMES_SHARED_KEY:?set HERMES_SHARED_KEY in .env.deploy}"
+      HERMES_ADAPTER_KEY: "${HERMES_SHARED_KEY:?set HERMES_SHARED_KEY in .env.deploy}"
+      STREAMING_TIMEOUT: "${STREAMING_TIMEOUT:-900}"
+      RELAY_IDLE_CONN_TIMEOUT: "${RELAY_IDLE_CONN_TIMEOUT:-300}"
+      GLOBAL_WEB_RATE_LIMIT_ENABLE: "${GLOBAL_WEB_RATE_LIMIT_ENABLE:-true}"
+      GLOBAL_WEB_RATE_LIMIT: "${GLOBAL_WEB_RATE_LIMIT:-1200}"
+      GLOBAL_WEB_RATE_LIMIT_DURATION: "${GLOBAL_WEB_RATE_LIMIT_DURATION:-60}"
+      GLOBAL_API_RATE_LIMIT_ENABLE: "${GLOBAL_API_RATE_LIMIT_ENABLE:-true}"
+      GLOBAL_API_RATE_LIMIT: "${GLOBAL_API_RATE_LIMIT:-1800}"
+      GLOBAL_API_RATE_LIMIT_DURATION: "${GLOBAL_API_RATE_LIMIT_DURATION:-60}"
+      SEARCH_RATE_LIMIT_ENABLE: "${SEARCH_RATE_LIMIT_ENABLE:-true}"
+      SEARCH_RATE_LIMIT: "${SEARCH_RATE_LIMIT:-120}"
+      SEARCH_RATE_LIMIT_DURATION: "${SEARCH_RATE_LIMIT_DURATION:-60}"
+      CRITICAL_RATE_LIMIT_ENABLE: "${CRITICAL_RATE_LIMIT_ENABLE:-true}"
+      CRITICAL_RATE_LIMIT: "${CRITICAL_RATE_LIMIT:-60}"
+      CRITICAL_RATE_LIMIT_DURATION: "${CRITICAL_RATE_LIMIT_DURATION:-300}"
+      COMMUNITY_REWARD_PROVIDER_SLUG: "${COMMUNITY_REWARD_PROVIDER_SLUG:-dc.hhhl.cc}"
+      COMMUNITY_REWARD_MISSKEY_HOST: "${COMMUNITY_REWARD_MISSKEY_HOST:-https://dc.hhhl.cc}"
+      COMMUNITY_REWARD_ROOM_ID: "${COMMUNITY_REWARD_ROOM_ID:-}"
+      COMMUNITY_REWARD_QUOTA: "${COMMUNITY_REWARD_QUOTA:-2500000}"
+      COMMUNITY_SITE_ID: "${COMMUNITY_SITE_ID:-prox}"
+      COMMUNITY_REWARD_DAILY_QUOTA: "${COMMUNITY_REWARD_DAILY_QUOTA:-500000}"
+      COMMUNITY_JOIN_REWARD_ENABLED: "${COMMUNITY_JOIN_REWARD_ENABLED:-false}"
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: [new-api-network]
+    ports:
+      - "127.0.0.1:3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/status | grep -q '\"success\":true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  oauth-worker:
+    image: node:22-alpine
+    container_name: new-api-oauth-worker
+    restart: always
+    working_dir: /app
+    command: ["node", "server.js"]
+    environment:
+      MISSKEY_HOST: "${COMMUNITY_REWARD_MISSKEY_HOST:-https://dc.hhhl.cc}"
+      PORT: "8787"
+      STATE_SIGNING_SECRET: "${OAUTH_STATE_SIGNING_SECRET:?set OAUTH_STATE_SIGNING_SECRET in .env.deploy}"
+      MIAUTH_PERMISSION: "${MIAUTH_PERMISSION:-read:account}"
+    volumes:
+      - ./oauth-worker:/app:ro
+    networks: [new-api-network]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8787/health | grep -q ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  new-api-proxy:
+    image: nginx:1.27-alpine
+    container_name: new-api-proxy
+    restart: always
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    depends_on:
+      new-api:
+        condition: service_healthy
+      oauth-worker:
+        condition: service_started
+    ports:
+      - "${SERVER_IP:?set SERVER_IP in .env.deploy}:80:80"
+      - "${SERVER_IP:?set SERVER_IP in .env.deploy}:443:443"
+    volumes:
+      - ./proxy/nginx-main.conf:/etc/nginx/nginx.conf:ro
+      - ./proxy/cloudflare-realip.conf:/etc/nginx/conf.d/cloudflare-realip.conf:ro
+      - ./proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./proxy/certs:/etc/nginx/certs:ro
+      - ./proxy/acme:/var/www/acme:ro
+      - ./proxy/logs:/var/log/nginx
+      - ./proxy/cache/nginx:/var/cache/nginx
+    networks: [new-api-network]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - --header='Host: ${PUBLIC_DOMAIN}' http://127.0.0.1/api/status | grep -q '\"success\":true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  new-api-network:
+    driver: bridge
