@@ -49,10 +49,16 @@ RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$
 FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
 ARG RELEASE_MARKER=development
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata libasan8 wget \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-ca-certificates
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+        if apt-get -o Acquire::Retries=5 update; then break; fi; \
+        if [ "$attempt" = 5 ]; then exit 1; fi; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep $((attempt * 2)); \
+    done; \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates tzdata libasan8 wget; \
+    rm -rf /var/lib/apt/lists/*; \
+    update-ca-certificates
 
 COPY --from=builder2 /build/new-api /
 COPY LICENSE NOTICE THIRD-PARTY-LICENSES.md /licenses/
