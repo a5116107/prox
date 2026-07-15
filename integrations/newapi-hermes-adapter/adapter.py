@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import datetime, json, os, time, traceback, urllib.request, urllib.error, hashlib, hmac, heapq as _heapq, sys as _sys, threading, re as _re, subprocess, html as _html
+
+import datetime
+import hashlib
+import heapq as _heapq
+import hmac
+import html as _html
+import json
+import os
+import re as _re
+import subprocess
+import sys as _sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,7 +94,7 @@ TG_WEBHOOK_SECRET = (
 IMAGE_API_BASE_URL = (
     os.environ.get("IMAGE_API_BASE_URL")
     or os.environ.get("IMAGE_OPENAI_BASE_URL")
-    or "https://ai.input.im/v1"
+    or "https://api.acica.top/v1"
 ).rstrip("/")
 IMAGE_API_KEY = (
     os.environ.get("IMAGE_API_KEY") or os.environ.get("IMAGE_OPENAI_API_KEY") or ""
@@ -87,7 +102,12 @@ IMAGE_API_KEY = (
 IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
 IMAGE_SIZE = os.environ.get("IMAGE_SIZE", "1024x1024").strip() or "1024x1024"
 IMAGE_TIMEOUT = float(os.environ.get("IMAGE_TIMEOUT", "300"))
-IMAGE_RETRY_LIMIT = max(1, int(os.environ.get("IMAGE_RETRY_LIMIT", "1")))
+IMAGE_RETRY_LIMIT = max(1, int(os.environ.get("IMAGE_RETRY_LIMIT", "2")))
+IMAGE_RETRY_BASE_DELAY = max(0.0, float(os.environ.get("IMAGE_RETRY_BASE_DELAY", "2")))
+IMAGE_RETRY_MAX_DELAY = max(
+    IMAGE_RETRY_BASE_DELAY,
+    float(os.environ.get("IMAGE_RETRY_MAX_DELAY", "15")),
+)
 IMAGE_COOLDOWN_SECONDS = max(0, int(os.environ.get("IMAGE_COOLDOWN_SECONDS", "45")))
 IMAGE_GROUP_NO_AT = os.environ.get("IMAGE_GROUP_NO_AT", "1").strip().lower() not in (
     "0",
@@ -4302,6 +4322,64 @@ def _image_headers():
     }
 
 
+_IMAGE_RETRYABLE_HTTP_STATUSES = frozenset(
+    {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+)
+_IMAGE_ERROR_SAFE_FIELDS = (
+    "code",
+    "type",
+    "message",
+    "title",
+    "status",
+    "detail",
+    "param",
+)
+
+
+def _redact_image_error_text(value):
+    text = str(value or "")
+    return _re.sub(
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "<redacted-email>",
+        text,
+    )
+
+
+def _image_http_error_detail(error):
+    try:
+        raw = error.read().decode("utf-8", "ignore")[:4096]
+    except Exception:
+        raw = ""
+    if not raw:
+        return _redact_image_error_text(getattr(error, "reason", "http_error"))[:300]
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return _redact_image_error_text(raw)[:300]
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        payload = payload["error"]
+    if isinstance(payload, dict):
+        safe = {
+            field: _redact_image_error_text(payload.get(field))
+            for field in _IMAGE_ERROR_SAFE_FIELDS
+            if payload.get(field) not in (None, "")
+        }
+        return json.dumps(safe, ensure_ascii=False, separators=(",", ":"))[:300]
+    return _redact_image_error_text(raw)[:300]
+
+
+def _image_retry_delay(attempt, error=None):
+    delay = IMAGE_RETRY_BASE_DELAY * (2 ** max(0, int(attempt) - 1))
+    headers = getattr(error, "headers", None)
+    retry_after = headers.get("Retry-After") if headers else None
+    if retry_after not in (None, ""):
+        try:
+            delay = max(delay, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    return min(IMAGE_RETRY_MAX_DELAY, max(0.0, delay))
+
+
 def _call_image_service(prompt):
     if not IMAGE_API_KEY or not IMAGE_API_BASE_URL:
         return {"ok": False, "error": "image_service_not_configured"}
@@ -4314,6 +4392,7 @@ def _call_image_service(prompt):
     }
     last_error = "unknown"
     for attempt in range(1, IMAGE_RETRY_LIMIT + 1):
+        retry_error = None
         try:
             req = urllib.request.Request(
                 IMAGE_API_BASE_URL + "/images/generations",
@@ -4340,24 +4419,25 @@ def _call_image_service(prompt):
                 }
             last_error = "image_service_empty_response"
         except urllib.error.HTTPError as e:
-            try:
-                detail = e.read().decode("utf-8", "ignore")[:300]
-            except Exception:
-                detail = ""
+            detail = _image_http_error_detail(e)
             last_error = f"http_{e.code}:{detail or e.reason}"
+            retryable = e.code in _IMAGE_RETRYABLE_HTTP_STATUSES
             print(
-                f"[Image] HTTPError attempt={attempt}/{IMAGE_RETRY_LIMIT} status={e.code} detail={detail}",
+                f"[Image] HTTPError attempt={attempt}/{IMAGE_RETRY_LIMIT} status={e.code} retryable={retryable} detail={detail}",
                 flush=True,
             )
-            if e.code in (400, 401, 403, 404, 422, 424, 524):
+            if not retryable:
                 break
+            retry_error = e
         except Exception as e:
-            last_error = str(e)
+            last_error = _redact_image_error_text(e)[:300]
             print(
                 f"[Image] error attempt={attempt}/{IMAGE_RETRY_LIMIT}: {e}", flush=True
             )
         if attempt < IMAGE_RETRY_LIMIT:
-            time.sleep(2 * attempt)
+            delay = _image_retry_delay(attempt, retry_error)
+            if delay > 0:
+                time.sleep(delay)
     return {"ok": False, "error": last_error[:300]}
 
 
@@ -4394,9 +4474,24 @@ def _human_image_error_message(username, error, msg_type="group"):
             prefix
             + "上游生图服务刚刚掉链子了，这次是服务侧的问题，不是你不会发。你稍后再来一条，我继续画。"
         )
+    if "content_policy_violation" in detail or "http_400" in detail:
+        return (
+            prefix
+            + "这条描述没有通过图片服务检查。换一种画面描述后再发，我继续给你画。"
+        )
     return (
         prefix + "这次图没出成功，我已经记下失败原因了。你稍后再发一次，我继续给你画。"
     )
+
+
+def _image_delivery_fallback_message(username, photo_url, msg_type="group"):
+    prefix = f"@{username} " if msg_type == "group" and username else ""
+    if str(photo_url or "").lower().startswith(("http://", "https://")):
+        return (
+            prefix
+            + f"图片已经生成，但 QQ 图片消息发送失败。你可以先打开原图：{photo_url}"
+        )
+    return prefix + "图片已经生成，但 QQ 图片消息发送失败。稍后再发一次，我继续处理。"
 
 
 def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt):
@@ -4406,10 +4501,36 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
             result = _call_image_service(prompt)
             latency = int((time.time() - started) * 1000)
             if result.get("ok") and result.get("photo_url"):
+                photo_url = result.get("photo_url")
                 caption = f"{username}，图已经生成好了：{prompt[:80]}"
-                reply_mid = send_qq_photo(
-                    msg_type, target_id, result.get("photo_url"), caption
-                )
+                reply_mid = send_qq_photo(msg_type, target_id, photo_url, caption)
+                if reply_mid is None:
+                    fallback_mid = send_qq_reply(
+                        msg_type,
+                        target_id,
+                        _image_delivery_fallback_message(username, photo_url, msg_type),
+                    )
+                    if msg_type == "group" and fallback_mid:
+                        _remember_recent_bot_group_reply(
+                            "qq",
+                            room_id,
+                            user_id,
+                            fallback_mid,
+                            reason="image_delivery_fallback",
+                        )
+                    log(
+                        {
+                            "event": "image_generate",
+                            "source": "qq",
+                            "room_id": room_id,
+                            "user_id": user_id,
+                            "status": "delivery_error",
+                            "latency_ms": latency,
+                            "prompt": prompt[:120],
+                            "photo": photo_url[:180],
+                        }
+                    )
+                    return
                 if msg_type == "group" and reply_mid:
                     _remember_recent_bot_group_reply(
                         "qq", room_id, user_id, reply_mid, reason="image_result"
@@ -4423,7 +4544,7 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
                         "status": "ok",
                         "latency_ms": latency,
                         "prompt": prompt[:120],
-                        "photo": result.get("photo_url", "")[:180],
+                        "photo": photo_url[:180],
                     }
                 )
                 return
@@ -4446,6 +4567,27 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
                     "latency_ms": latency,
                     "prompt": prompt[:120],
                     "detail": str(result.get("error") or "")[:200],
+                }
+            )
+        except Exception as e:
+            latency = int((time.time() - started) * 1000)
+            detail = _redact_image_error_text(e)[:200]
+            print(f"[Image] worker error: {detail}", flush=True)
+            send_qq_reply(
+                msg_type,
+                target_id,
+                _human_image_error_message(username, detail, msg_type),
+            )
+            log(
+                {
+                    "event": "image_generate",
+                    "source": "qq",
+                    "room_id": room_id,
+                    "user_id": user_id,
+                    "status": "worker_error",
+                    "latency_ms": latency,
+                    "prompt": prompt[:120],
+                    "detail": detail,
                 }
             )
         finally:
@@ -5359,7 +5501,6 @@ def handle_with_games(payload):
         return None
     try:
         gid = str(payload.get("group_id", payload.get("chat_id", "")))
-        anns = []
         platform = str(
             payload.get("platform")
             or payload.get("source")
@@ -5782,7 +5923,7 @@ def handle_admin(path, req):
         n = int(req.headers.get("Content-Length", "0") or "0")
         raw = req.rfile.read(min(n, 500_000))
         payload = json.loads(raw.decode("utf-8") or "{}")
-    except:
+    except Exception:
         payload = {}
     if req.command == "GET":
         query = parse_qs(urlparse(req.path).query, keep_blank_values=True)

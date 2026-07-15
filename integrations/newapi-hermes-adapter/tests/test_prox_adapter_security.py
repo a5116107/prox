@@ -8,6 +8,7 @@ import json
 import sys
 import threading
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,16 @@ _ISOLATED_ENV_KEYS = (
     "HERMES_BURN_QUEUE_CAPACITY",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
+    "IMAGE_API_BASE_URL",
+    "IMAGE_OPENAI_BASE_URL",
+    "IMAGE_API_KEY",
+    "IMAGE_OPENAI_API_KEY",
+    "IMAGE_MODEL",
+    "IMAGE_SIZE",
+    "IMAGE_TIMEOUT",
+    "IMAGE_RETRY_LIMIT",
+    "IMAGE_RETRY_BASE_DELAY",
+    "IMAGE_RETRY_MAX_DELAY",
 )
 
 
@@ -773,3 +784,194 @@ def test_bind_burn_queue_overload_withdraws_synchronously_and_logs(
     finally:
         adapter._stop_burn_scheduler(clear_pending=True)
     assert adapter._burn_scheduler_snapshot()["worker_alive"] is False
+
+
+def test_image_prompt_detection_accepts_commands_without_false_positives(
+    adapter_loader,
+):
+    adapter = adapter_loader()
+
+    assert (
+        adapter.detect_image_prompt(
+            "\u751f\u6210\u897f\u6e38\u8bb0\u4efb\u52a1\u62c6\u89e34k\u56fe\u7247"
+        )
+        == "\u897f\u6e38\u8bb0\u4efb\u52a1\u62c6\u89e34k"
+    )
+    assert (
+        adapter.detect_image_prompt(
+            "\u751f\u56fe\uff1a\u897f\u6e38\u8bb0\u4eba\u7269\u62c6\u89e3\uff0c4k"
+        )
+        == "\u897f\u6e38\u8bb0\u4eba\u7269\u62c6\u89e3\uff0c4k"
+    )
+    assert (
+        adapter.detect_image_prompt("\u753b\u56fe\u753b\u7279\u6717\u666e")
+        == "\u753b\u7279\u6717\u666e"
+    )
+    assert (
+        adapter.detect_image_prompt("\u751f\u56fe\u7684\u9700\u6c42\u5f88\u591a") == ""
+    )
+    assert (
+        adapter.detect_image_prompt("\u8fd9\u5f20\u56fe\u753b\u5f97\u4e0d\u9519") == ""
+    )
+
+
+def test_image_service_retries_transient_524_and_returns_generated_url(
+    adapter_loader, monkeypatch
+):
+    adapter = adapter_loader(
+        IMAGE_API_BASE_URL="https://images.example.test/v1",
+        IMAGE_API_KEY="image-test-key",
+        IMAGE_MODEL="gpt-image-2",
+        IMAGE_RETRY_LIMIT="2",
+        IMAGE_RETRY_BASE_DELAY="0",
+        IMAGE_RETRY_MAX_DELAY="0",
+    )
+    requests = []
+
+    def fake_urlopen(request, timeout=0):
+        requests.append((request, timeout))
+        if len(requests) == 1:
+            body = io.BytesIO(
+                json.dumps(
+                    {
+                        "error": {
+                            "message": "temporary upstream timeout",
+                            "code": "upstream_timeout",
+                            "account_email": "must-not-be-logged@example.test",
+                        }
+                    }
+                ).encode("utf-8")
+            )
+            raise urllib.error.HTTPError(
+                request.full_url,
+                524,
+                "timeout",
+                {"Retry-After": "0"},
+                body,
+            )
+        return _FakeHTTPResponse(
+            {"data": [{"url": "https://cdn.example.test/generated.png"}]}
+        )
+
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        adapter.time,
+        "sleep",
+        lambda seconds: pytest.fail(f"zero-delay retry slept for {seconds}"),
+    )
+
+    result = adapter._call_image_service("\u4e00\u53ea\u767d\u8272\u5496\u5561\u676f")
+
+    assert result == {
+        "ok": True,
+        "photo_url": "https://cdn.example.test/generated.png",
+        "revised_prompt": "",
+    }
+    assert len(requests) == 2
+    assert (
+        requests[0][0].full_url == "https://images.example.test/v1/images/generations"
+    )
+    sent_payload = json.loads(requests[0][0].data)
+    assert sent_payload["model"] == "gpt-image-2"
+    assert sent_payload["response_format"] == "url"
+
+
+def test_image_service_does_not_retry_auth_failure_and_redacts_upstream_identity(
+    adapter_loader, monkeypatch
+):
+    adapter = adapter_loader(
+        IMAGE_API_BASE_URL="https://images.example.test/v1",
+        IMAGE_API_KEY="invalid-image-key",
+        IMAGE_RETRY_LIMIT="3",
+        IMAGE_RETRY_BASE_DELAY="0",
+    )
+    calls = []
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(request)
+        body = io.BytesIO(
+            json.dumps(
+                {
+                    "error": {
+                        "message": "invalid credential",
+                        "code": "invalid_api_key",
+                        "account_email": "private@example.test",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        raise urllib.error.HTTPError(request.full_url, 401, "unauthorized", {}, body)
+
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+
+    result = adapter._call_image_service("\u6d4b\u8bd5\u56fe\u7247")
+
+    assert result["ok"] is False
+    assert result["error"].startswith("http_401:")
+    assert "invalid_api_key" in result["error"]
+    assert "private@example.test" not in result["error"]
+    assert "account_email" not in result["error"]
+    assert len(calls) == 1
+
+
+def test_image_job_reports_delivery_failure_and_keeps_generated_link(
+    adapter_loader, monkeypatch
+):
+    adapter = adapter_loader()
+    replies = []
+    logs = []
+    adapter._set_image_pending(
+        "qq",
+        "925249987",
+        "1001",
+        "\u4e00\u53ea\u767d\u8272\u5496\u5561\u676f",
+    )
+
+    monkeypatch.setattr(
+        adapter,
+        "_call_image_service",
+        lambda prompt: {
+            "ok": True,
+            "photo_url": "https://cdn.example.test/generated.png",
+            "revised_prompt": "",
+        },
+    )
+    monkeypatch.setattr(adapter, "send_qq_photo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        adapter,
+        "send_qq_reply",
+        lambda *args: replies.append(args) or "fallback-message-id",
+    )
+    monkeypatch.setattr(adapter, "log", lambda event: logs.append(event))
+
+    def run_inline(job, **_kwargs):
+        job()
+        return True
+
+    monkeypatch.setattr(adapter, "_submit_background", run_inline)
+
+    adapter._start_qq_image_job(
+        "group",
+        "925249987",
+        "925249987",
+        "1001",
+        "\u6d4b\u8bd5\u7528\u6237",
+        "\u4e00\u53ea\u767d\u8272\u5496\u5561\u676f",
+    )
+
+    assert len(replies) == 1
+    assert "https://cdn.example.test/generated.png" in replies[0][2]
+    image_logs = [event for event in logs if event.get("event") == "image_generate"]
+    assert image_logs[-1]["status"] == "delivery_error"
+    assert adapter._get_image_pending("qq", "925249987", "1001") is None
+
+
+def test_image_delivery_fallback_does_not_expose_base64_payload(adapter_loader):
+    adapter = adapter_loader()
+
+    message = adapter._image_delivery_fallback_message(
+        "tester", "base64://private-image-payload", "private"
+    )
+
+    assert "private-image-payload" not in message
+    assert "QQ" in message

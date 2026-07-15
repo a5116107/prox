@@ -37,6 +37,22 @@ docker exec new-api getent hosts host.docker.internal
 
 Verify `HERMES_SHARED_KEY` matches `HERMES_ADAPTER_KEY`/`GAME_ADMIN_KEY`, the OneBot/TG endpoint is reachable, and only one consumer owns each message claim. Adapter writable files must be under `/var/lib/prox-hermes`.
 
+## QQ image generation fails
+
+```bash
+systemctl show prox-hermes-adapter -p MainPID -p EnvironmentFiles --no-pager
+journalctl -u prox-hermes-adapter --since '2 hours ago' --no-pager \
+  | grep -E '\[Image\]|image_generate|Photo send'
+grep -E '^(IMAGE_API_BASE_URL|IMAGE_MODEL|IMAGE_SIZE|IMAGE_RETRY_LIMIT)=' \
+  /etc/prox/hermes.env
+```
+
+An HTTP `401/403` means the image credential must be rotated. HTTP `502/524`
+is transient and is retried within `IMAGE_RETRY_LIMIT`; persistent failures
+must remain visible as `image_generate status=error`. A successful generation
+with `status=delivery_error` points to OneBot image delivery, and the Adapter
+sends the generated URL as a fallback so the result is not lost.
+
 ## Quiz has no question
 
 Check that the bank has published questions, the bank itself is published, and an exact or wildcard binding matches site/platform/group. Then inspect `/api/ops/quiz/<site>/stats`. The Adapter no longer falls back to a hard-coded question list.

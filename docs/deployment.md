@@ -38,6 +38,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now prox-hermes-adapter
 ```
 
+Set `IMAGE_API_BASE_URL`, `IMAGE_API_KEY`, and `IMAGE_MODEL` in
+`/etc/prox/hermes.env` before starting the Adapter. The production image key
+must live only in that mode-`0600` environment file. Validate the configured
+provider without printing the key:
+
+```bash
+sudo bash -c 'set -a; source /etc/prox/hermes.env; set +a; \
+  curl -fsS -H "Authorization: Bearer $IMAGE_API_KEY" \
+  "$IMAGE_API_BASE_URL/models" | grep -q "gpt-image-2"'
+```
+
 Start stateful services and release the application image:
 
 ```bash
