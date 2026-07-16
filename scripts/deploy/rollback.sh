@@ -26,7 +26,8 @@ docker image inspect "$TARGET_IMAGE" >/dev/null
 TARGET_MARKER="$(image_release_marker "$TARGET_IMAGE")"
 log "rolling back only new-api from ${CURRENT_IMAGE:-unknown} to $TARGET_IMAGE"
 switch_newapi_image "$TARGET_IMAGE"
-wait_newapi "$TARGET_MARKER"
+ALLOW_LEGACY_RELEASE_MARKER=1 ALLOW_LEGACY_QUIZ_ROUTE=1 \
+  wait_newapi "$TARGET_MARKER" "$TARGET_IMAGE"
 
 cat >"$RELEASES_DIR/current.env" <<EOF
 RELEASE_TAG=${TARGET_MARKER:-rollback}

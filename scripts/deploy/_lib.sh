@@ -217,6 +217,29 @@ check_newapi_static_assets() {
   printf '%s\n' "$asset"
 }
 
+wait_for_release_marker() {
+  local expected_marker="$1" actual_marker=""
+  for _ in $(seq 1 "${MARKER_RETRIES:-15}"); do
+    actual_marker="$(curl --fail --silent --show-error --max-time 5 \
+      http://127.0.0.1:3000/release-marker.txt 2>/dev/null | tr -d '\r\n' || true)"
+    if [[ "$actual_marker" == "$expected_marker" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  log "release marker mismatch: expected=$expected_marker actual=${actual_marker:-missing}"
+  return 1
+}
+
+quiz_route_status_is_acceptable() {
+  local status="$1"
+  case "$status" in
+    200|401|403) return 0 ;;
+    404) [[ "${ALLOW_LEGACY_QUIZ_ROUTE:-0}" == "1" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 check_agent_image_config() {
   local base_url="http://127.0.0.1:3000" status adapter_auth_value body
   status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
@@ -292,7 +315,8 @@ image_release_marker() {
 }
 
 wait_newapi() {
-  local expected_marker="${1:-}" health="" body="" actual_marker="" route_status=""
+  local expected_marker="${1:-}" expected_image="${2:-}" health="" body="" route_status=""
+  local actual_image=""
   local adapter_health_url="" adapter_body="" static_asset="" surface_ready=0
   for _ in $(seq 1 "${HEALTH_RETRIES:-60}"); do
     health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$NEWAPI_CONTAINER" 2>/dev/null || true)"
@@ -306,23 +330,27 @@ wait_newapi() {
   done
   printf '%s' "$body" | json_success_response || return 1
 
-  if [[ -n "$expected_marker" ]]; then
-    actual_marker="$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3000/release-marker.txt 2>/dev/null | tr -d '\r\n' || true)"
-    [[ "$actual_marker" == "$expected_marker" ]] || {
-      log "release marker mismatch: expected=$expected_marker actual=${actual_marker:-missing}"
+  if [[ -n "$expected_image" ]]; then
+    actual_image="$(current_container_image)"
+    [[ "$actual_image" == "$expected_image" ]] || {
+      log "container image mismatch: expected=$expected_image actual=${actual_image:-missing}"
       return 1
     }
   fi
 
+  if [[ -n "$expected_marker" ]]; then
+    if ! wait_for_release_marker "$expected_marker"; then
+      [[ "${ALLOW_LEGACY_RELEASE_MARKER:-0}" == "1" ]] || return 1
+      log "legacy rollback image has no matching release marker; image identity is verified"
+    fi
+  fi
+
   route_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 \
     "http://127.0.0.1:3000/api/ops/quiz/${COMMUNITY_SITE_ID:-prox}/stats" || true)"
-  case "$route_status" in
-    200|401|403) ;;
-    *)
-      log "quiz API route smoke failed with HTTP $route_status"
-      return 1
-      ;;
-  esac
+  quiz_route_status_is_acceptable "$route_status" || {
+    log "quiz API route smoke failed with HTTP $route_status"
+    return 1
+  }
 
   adapter_health_url="$(resolve_hermes_adapter_health_url)" || return 1
   for _ in $(seq 1 "${SURFACE_RETRIES:-15}"); do

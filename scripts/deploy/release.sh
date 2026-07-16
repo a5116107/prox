@@ -26,7 +26,7 @@ rollback_on_error() {
   if (( switched == 1 )) && [[ -n "$PREVIOUS_IMAGE" ]]; then
     log "release failed; restoring $PREVIOUS_IMAGE"
     switch_newapi_image "$PREVIOUS_IMAGE" || true
-    wait_newapi || true
+    ALLOW_LEGACY_QUIZ_ROUTE=1 wait_newapi "" "$PREVIOUS_IMAGE" || true
   fi
   exit "$status"
 }
@@ -51,7 +51,7 @@ EOF
 log "switching only new-api from ${PREVIOUS_IMAGE:-none} to $NEW_IMAGE"
 switched=1
 switch_newapi_image "$NEW_IMAGE"
-wait_newapi "$TAG"
+wait_newapi "$TAG" "$NEW_IMAGE"
 switched=0
 trap - ERR
 

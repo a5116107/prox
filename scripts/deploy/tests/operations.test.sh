@@ -48,6 +48,15 @@ declare -F latest_matching_file >/dev/null \
   || fail "latest file selection helper is missing"
 declare -F file_age_seconds >/dev/null \
   || fail "file age helper is missing"
+declare -F wait_for_release_marker >/dev/null \
+  || fail "release marker retry helper is missing"
+
+ALLOW_LEGACY_QUIZ_ROUTE=0 assert_success "current quiz route rejected" \
+  quiz_route_status_is_acceptable 401
+ALLOW_LEGACY_QUIZ_ROUTE=0 assert_failure "legacy quiz route accepted during release" \
+  quiz_route_status_is_acceptable 404
+ALLOW_LEGACY_QUIZ_ROUTE=1 assert_success "legacy quiz route rejected during rollback" \
+  quiz_route_status_is_acceptable 404
 
 printf '%s' '{"success":true}' | json_success_response || fail "valid status response rejected"
 if printf '%s' '{"success":false}' | json_success_response; then
