@@ -130,6 +130,7 @@ networks.
 Install and enable all production operations units:
 
 ```bash
+sudo install -m 600 deploy/systemd/prox-operations.env.example /etc/prox/operations.env
 sudo cp deploy/systemd/prox-{monitor,backup,restore-drill,cleanup}.{service,timer} /etc/systemd/system/
 sudo cp deploy/logrotate/prox /etc/logrotate.d/prox
 sudo systemctl daemon-reload

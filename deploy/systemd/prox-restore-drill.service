@@ -7,6 +7,7 @@ Requires=docker.service
 Type=oneshot
 User=root
 WorkingDirectory=/opt/prox/current
+EnvironmentFile=-/etc/prox/operations.env
 ExecStart=/usr/bin/bash /opt/prox/current/scripts/deploy/restore-drill.sh
 UMask=0077
 NoNewPrivileges=true

@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/opt/prox/current
+EnvironmentFile=-/etc/prox/operations.env
 EnvironmentFile=-/etc/prox/monitor.env
 ExecStart=/usr/bin/bash /opt/prox/current/scripts/deploy/monitor.sh
 NoNewPrivileges=true

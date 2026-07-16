@@ -7,6 +7,7 @@ Requires=docker.service
 Type=oneshot
 User=root
 WorkingDirectory=/opt/prox/current
+EnvironmentFile=-/etc/prox/operations.env
 Environment=RCLONE_CONFIG=/etc/rclone/rclone.conf
 ExecStart=/usr/bin/bash /opt/prox/current/scripts/deploy/backup.sh
 TimeoutStartSec=2h

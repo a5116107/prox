@@ -19,6 +19,7 @@ frontend unit.
 /opt/prox/current/logs             new-api logs
 /var/lib/prox-hermes               Adapter writable state
 /etc/prox/hermes.env               Adapter secrets, mode 0600
+/etc/prox/operations.env           runtime path and container overrides, mode 0600
 /var/backups/prox                  encrypted backup archives, mode 0700
 /etc/prox/backup-age.key           restore identity, mode 0600
 ```
@@ -86,6 +87,7 @@ sudo chmod 600 /etc/prox/backup-age.key
 recipient="$(sudo age-keygen -y /etc/prox/backup-age.key)"
 sudo sed -i "s|^# BACKUP_AGE_RECIPIENT=.*|BACKUP_AGE_RECIPIENT=$recipient|" .env.deploy
 printf '%s\n' 'BACKUP_AGE_IDENTITY_FILE=/etc/prox/backup-age.key' | sudo tee -a .env.deploy >/dev/null
+sudo install -m 600 deploy/systemd/prox-operations.env.example /etc/prox/operations.env
 sudo cp deploy/systemd/prox-{monitor,backup,restore-drill,cleanup}.{service,timer} /etc/systemd/system/
 sudo cp deploy/logrotate/prox /etc/logrotate.d/prox
 sudo chmod 644 /etc/logrotate.d/prox
@@ -99,6 +101,26 @@ sudo bash scripts/deploy/restore-drill.sh
 Store a second copy of the age identity outside this host. When using rclone,
 place its root-owned configuration at `/etc/rclone/rclone.conf` and set a
 dedicated `BACKUP_RCLONE_DEST` prefix.
+
+For a staged migration where the active Compose project and persistent mounts
+remain under `/opt/new-api-dev`, keep the clean source checkout at
+`/opt/prox/current` and set the runtime contract explicitly:
+
+```bash
+sudo tee /etc/prox/operations.env >/dev/null <<'EOF'
+ENV_FILE=/opt/new-api-dev/.env.deploy
+COMPOSE_FILE=/opt/new-api-dev/compose.prod.yml
+RELEASES_DIR=/opt/new-api-releases
+HERMES_ADAPTER_ENV_FILE=/etc/prox/hermes.env
+HERMES_STATE_DIR=/var/lib/prox-hermes
+IMAGE_REPOSITORY=ops-registry-live-prox
+MONITOR_CONTAINERS="new-api new-api-proxy postgres redis new-api-oauth-worker"
+EOF
+sudo chmod 600 /etc/prox/operations.env
+```
+
+This preserves the existing Compose project, network, PostgreSQL, Redis, and
+bind mounts while builds continue to use the clean canonical checkout.
 
 Image settings saved in Agent Ops are read through the internal no-store
 endpoint and become effective after at most `IMAGE_CONFIG_CACHE_TTL_SECONDS`;

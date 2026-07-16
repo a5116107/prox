@@ -7,6 +7,9 @@ cd /opt/prox/current
 git fetch origin
 git switch main
 git pull --ff-only
+set -a
+source /etc/prox/operations.env
+set +a
 bash scripts/deploy/release.sh
 ```
 
@@ -34,12 +37,18 @@ succeed for a `main` or `v*` push. Manual image builds remain available through
 Rollback to the previous image recorded by the latest release:
 
 ```bash
+set -a
+source /etc/prox/operations.env
+set +a
 bash scripts/deploy/rollback.sh
 ```
 
 Rollback to a specific retained image:
 
 ```bash
+set -a
+source /etc/prox/operations.env
+set +a
 bash scripts/deploy/rollback.sh prox-new-api:RELEASE_TAG
 ```
 

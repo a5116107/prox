@@ -141,9 +141,17 @@ age_seconds="$(file_age_seconds "$latest")"
 
 grep -Fxq 'TimeoutStartSec=2h' "$REPO_ROOT/deploy/systemd/prox-backup.service" \
   || fail "backup service does not allow large database dumps to complete"
+for service in prox-backup prox-cleanup prox-monitor prox-restore-drill; do
+  grep -Fxq 'EnvironmentFile=-/etc/prox/operations.env' \
+    "$REPO_ROOT/deploy/systemd/$service.service" \
+    || fail "$service service does not load the shared operations environment"
+done
 grep -Fq 'ReadWritePaths=/var/backups/prox /tmp' \
   "$REPO_ROOT/deploy/systemd/prox-restore-drill.service" \
   || fail "restore drill cannot persist its success state"
+grep -Fxq 'ReadWritePaths=/opt/prox/current/releases /opt/new-api-releases' \
+  "$REPO_ROOT/deploy/systemd/prox-cleanup.service" \
+  || fail "cleanup service cannot manage migration release metadata"
 grep -Fq 'max-size: "50m"' "$REPO_ROOT/compose.prod.yml" \
   || fail "production container logs are unbounded"
 grep -Fxq '    copytruncate' "$REPO_ROOT/deploy/logrotate/prox" \
