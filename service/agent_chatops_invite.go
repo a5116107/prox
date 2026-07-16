@@ -70,7 +70,14 @@ type AgentChatOpsInviteResult struct {
 
 func HandleAgentChatOpsInvite(req AgentChatOpsInviteRequest) (AgentChatOpsInviteResult, error) {
 	req.normalize()
+	gamePolicy, err := resolveEffectiveGroupGamePolicyTx(model.DB, AgentSiteID(), req.Source, req.RoomID, "invite")
+	if err != nil {
+		return AgentChatOpsInviteResult{}, err
+	}
 	if cfg, ok := chatOpsGroupConfigByScope(req.Source, req.RoomID); ok && !cfg.InviteEnabled && req.Action != "stats" {
+		return AgentChatOpsInviteResult{Success: false, Action: req.Action, Status: "disabled", Reply: "本群邀请奖励暂未开启，请关注管理员公告。"}, nil
+	}
+	if gamePolicy.Found && !gamePolicy.Enabled && req.Action != "stats" {
 		return AgentChatOpsInviteResult{Success: false, Action: req.Action, Status: "disabled", Reply: "本群邀请奖励暂未开启，请关注管理员公告。"}, nil
 	}
 	switch req.Action {
@@ -138,6 +145,10 @@ func handleAgentChatOpsInviteLink(req AgentChatOpsInviteRequest) (AgentChatOpsIn
 	}
 	var out AgentChatOpsInviteResult
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		rewardPolicy, err := inviteRewardConfigTx(tx, req)
+		if err != nil {
+			return err
+		}
 		campaign, err := ensureAgentInviteCampaignTx(tx, req)
 		if err != nil {
 			return err
@@ -159,7 +170,7 @@ func handleAgentChatOpsInviteLink(req AgentChatOpsInviteRequest) (AgentChatOpsIn
 			return err
 		}
 		_ = tx.Create(&model.InviteEvent{SiteId: AgentSiteID(), CampaignId: campaign.Id, InviteLinkId: link.Id, EventType: "link", Provider: req.Source, ExternalUserId: req.UserExternalID, UserId: inviterID, GroupId: req.RoomID, MetadataJson: inviteMetadataJSON(req), CreatedAt: now}).Error
-		out = AgentChatOpsInviteResult{Success: true, Action: "link", Status: "ok", CampaignID: campaign.Id, CampaignCode: campaign.CampaignCode, InviteLinkID: link.Id, InviteCode: link.InviteCode, InviteURL: link.InviteUrl, InviterUserID: inviterID}
+		out = AgentChatOpsInviteResult{Success: true, Action: "link", Status: "ok", CampaignID: campaign.Id, CampaignCode: campaign.CampaignCode, InviteLinkID: link.Id, InviteCode: link.InviteCode, InviteURL: link.InviteUrl, InviterUserID: inviterID, InviterRewardQuota: rewardPolicy.InviterQuota, InviteeRewardQuota: rewardPolicy.InviteeQuota}
 		return nil
 	})
 	if err == nil && out.Success {
@@ -231,7 +242,11 @@ func handleAgentChatOpsInviteVerifyClaim(req AgentChatOpsInviteRequest) (AgentCh
 			out = AgentChatOpsInviteResult{Success: true, Action: "verify_claim", Status: "invalid_inviter", InviteEdgeID: edge.Id, InviterUserID: edge.InviterUserId, InviteeUserID: inviteeID}
 			return nil
 		}
-		inviterReward, inviteeReward, pool := inviteRewardConfigTx(tx, req)
+		rewardPolicy, err := inviteRewardConfigTx(tx, req)
+		if err != nil {
+			return err
+		}
+		inviterReward, inviteeReward, pool := rewardPolicy.InviterQuota, rewardPolicy.InviteeQuota, rewardPolicy.BudgetPool
 		now := time.Now().Unix()
 		updates := map[string]interface{}{"stage": "verified", "status": "verified", "updated_at": now}
 		if edge.InviteeUserId <= 0 {
@@ -243,14 +258,14 @@ func handleAgentChatOpsInviteVerifyClaim(req AgentChatOpsInviteRequest) (AgentCh
 		}
 		claims := make([]AgentChatOpsInviteClaim, 0, 2)
 		if inviterReward > 0 {
-			c, err := payInviteRewardClaimTx(tx, req, campaign, edge, "inviter", edge.InviterUserId, inviterReward, pool)
+			c, err := payInviteRewardClaimTx(tx, req, campaign, edge, "inviter", edge.InviterUserId, inviterReward, pool, rewardPolicy.MaxPerUserDay)
 			if err != nil {
 				return err
 			}
 			claims = append(claims, c)
 		}
 		if inviteeReward > 0 {
-			c, err := payInviteRewardClaimTx(tx, req, campaign, edge, "invitee", inviteeID, inviteeReward, pool)
+			c, err := payInviteRewardClaimTx(tx, req, campaign, edge, "invitee", inviteeID, inviteeReward, pool, rewardPolicy.MaxPerUserDay)
 			if err != nil {
 				return err
 			}
@@ -454,7 +469,7 @@ func findOrCreateClaimableInviteEdgeTx(tx *gorm.DB, req AgentChatOpsInviteReques
 	return campaign, edgePtr, errp
 }
 
-func payInviteRewardClaimTx(tx *gorm.DB, req AgentChatOpsInviteRequest, campaign *model.InviteCampaign, edge *model.InviteEdge, stage string, rewardUserID int, quota int, pool string) (AgentChatOpsInviteClaim, error) {
+func payInviteRewardClaimTx(tx *gorm.DB, req AgentChatOpsInviteRequest, campaign *model.InviteCampaign, edge *model.InviteEdge, stage string, rewardUserID int, quota int, pool string, maxPerUserDay int) (AgentChatOpsInviteClaim, error) {
 	out := AgentChatOpsInviteClaim{Stage: stage, RewardUserID: rewardUserID, Quota: quota, Status: "skipped"}
 	if rewardUserID <= 0 || quota <= 0 {
 		return out, nil
@@ -470,8 +485,59 @@ func payInviteRewardClaimTx(tx *gorm.DB, req AgentChatOpsInviteRequest, campaign
 			out.Status = "already_paid"
 			return out, nil
 		}
+		if strings.TrimSpace(claim.Status) == "blocked_daily_limit" {
+			out.Status = claim.Status
+			out.Error = claim.Error
+			return out, nil
+		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return out, err
+	}
+	if maxPerUserDay > 0 && !claimFound {
+		var rewardUser model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Where("id = ?", rewardUserID).First(&rewardUser).Error; err != nil {
+			return out, err
+		}
+		// Another node may have created this claim while this transaction was
+		// waiting for the per-user serialization lock. Reload before counting so
+		// an already-paid edge is replayed instead of reported as rate-limited.
+		var concurrentClaim model.InviteRewardClaim
+		if err := tx.Where("site_id = ? AND invite_edge_id = ? AND reward_stage = ?", AgentSiteID(), edge.Id, stage).First(&concurrentClaim).Error; err == nil {
+			claim = concurrentClaim
+			claimFound = true
+			out.ClaimID = claim.Id
+			out.OpsFundLedgerID = claim.OpsFundLedgerId
+			switch strings.TrimSpace(claim.Status) {
+			case "paid":
+				out.Status = "already_paid"
+				return out, nil
+			case "blocked_daily_limit":
+				out.Status = claim.Status
+				out.Error = claim.Error
+				return out, nil
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return out, err
+		}
+	}
+	if maxPerUserDay > 0 && !claimFound {
+		dayStart := model.AgentBusinessDayStartAt(time.Now()).Unix()
+		var paidToday int64
+		if err := tx.Model(&model.InviteRewardClaim{}).
+			Where("site_id = ? AND reward_user_id = ? AND status IN ? AND created_at >= ?", AgentSiteID(), rewardUserID, []string{"pending", "paid"}, dayStart).
+			Count(&paidToday).Error; err != nil {
+			return out, err
+		}
+		if paidToday >= int64(maxPerUserDay) {
+			claim = model.InviteRewardClaim{SiteId: AgentSiteID(), CampaignId: campaign.Id, InviteEdgeId: edge.Id, RewardStage: stage, RewardUserId: rewardUserID, Quota: quota, Status: "blocked_daily_limit", Error: fmt.Sprintf("invite daily reward limit reached: %d", maxPerUserDay), CreatedAt: now, UpdatedAt: now}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim).Error; err != nil {
+				return out, err
+			}
+			out.ClaimID = claim.Id
+			out.Status = claim.Status
+			out.Error = claim.Error
+			return out, nil
+		}
 	}
 	benefitExternalID := firstNonEmptyAgent(req.InviteeExternalID, req.InviterExternalID, req.UserExternalID)
 	if strings.TrimSpace(stage) == "inviter" {
@@ -569,28 +635,49 @@ func inviteRewardSourceType(stage string) string {
 	}
 }
 
-func inviteRewardConfigTx(tx *gorm.DB, req AgentChatOpsInviteRequest) (int, int, string) {
-	inviter := req.InviterRewardQuota
-	invitee := req.InviteeRewardQuota
-	pool := firstNonEmptyAgent(req.BudgetPool, "community")
+type inviteRewardPolicy struct {
+	InviterQuota  int
+	InviteeQuota  int
+	BudgetPool    string
+	MaxPerUserDay int
+}
+
+func inviteRewardConfigTx(tx *gorm.DB, req AgentChatOpsInviteRequest) (inviteRewardPolicy, error) {
+	policy := inviteRewardPolicy{InviterQuota: 1500000, InviteeQuota: 750000, BudgetPool: "community", MaxPerUserDay: 10}
+	gamePolicy, err := resolveEffectiveGroupGamePolicyTx(tx, AgentSiteID(), req.Source, req.RoomID, "invite")
+	if err != nil {
+		return policy, err
+	}
+	rules := gamePolicy.Rules
+	if rules == nil {
+		rules = map[string]any{}
+	}
 	if cfg, ok := chatOpsGroupConfigByScopeFromDB(tx, req.Source, req.RoomID); ok {
+		chatOpsRules := chatOpsNestedMap(chatOpsJSONMap(cfg.RuleJson)["invite"])
+		rules = mergeGamePolicyMaps(rules, chatOpsRules)
 		if cfg.InviteRewardQuota > 0 {
-			inviter = cfg.InviteRewardQuota
+			policy.InviterQuota = cfg.InviteRewardQuota
 		}
 		if cfg.InviteeRewardQuota > 0 {
-			invitee = cfg.InviteeRewardQuota
+			policy.InviteeQuota = cfg.InviteeRewardQuota
 		}
 	}
-	if inviter <= 0 {
-		inviter = 1500000
+	if value, ok := gamePolicyInt(rules, "inviter_reward_quota"); ok {
+		policy.InviterQuota = value
+	} else if value, ok := gamePolicyInt(rules, "reward_quota"); ok {
+		policy.InviterQuota = value
 	}
-	if invitee < 0 {
-		invitee = 0
+	if value, ok := gamePolicyInt(rules, "invitee_reward_quota"); ok {
+		policy.InviteeQuota = value
 	}
-	if invitee == 0 {
-		invitee = 750000
+	if value, ok := gamePolicyInt(rules, "max_per_user_day"); ok {
+		policy.MaxPerUserDay = value
 	}
-	return inviter, invitee, pool
+	if policy.InviterQuota < 0 || policy.InviteeQuota < 0 || policy.MaxPerUserDay < 0 {
+		return policy, errors.New("invite reward policy contains a negative value")
+	}
+	policy.BudgetPool, err = effectivePolicyBudgetPool(gamePolicy, rules, "community")
+	return policy, err
 }
 
 func defaultInviteCampaignCode(req AgentChatOpsInviteRequest) string {

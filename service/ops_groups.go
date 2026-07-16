@@ -457,14 +457,23 @@ func SaveOpsGroupGames(siteID string, id int, req OpsGroupGamesUpdateRequest) (*
 	if len(req.Games) == 0 {
 		return nil, errors.New("at least one game rule is required")
 	}
+	rows := make([]model.GroupGameConfig, 0, len(req.Games))
+	seen := make(map[string]struct{}, len(req.Games))
 	for _, item := range req.Games {
 		gameCode := strings.TrimSpace(strings.ToLower(item.GameCode))
 		if gameCode == "" {
 			return nil, errors.New("game_code is required")
 		}
+		if _, exists := seen[gameCode]; exists {
+			return nil, fmt.Errorf("duplicate game_code: %s", gameCode)
+		}
+		seen[gameCode] = struct{}{}
 		budgetPool := strings.TrimSpace(strings.ToLower(item.BudgetPool))
 		if budgetPool == "" {
 			budgetPool = "game"
+		}
+		if err := model.ValidateOpsPoolType(budgetPool); err != nil {
+			return nil, fmt.Errorf("invalid budget_pool for %s: %w", gameCode, err)
 		}
 		enabled := true
 		if item.Enabled != nil {
@@ -478,7 +487,7 @@ func SaveOpsGroupGames(siteID string, id int, req OpsGroupGamesUpdateRequest) (*
 				return nil, fmt.Errorf("invalid game rule for %s: %w", gameCode, marshalErr)
 			}
 		}
-		if err := model.UpsertGroupGameConfig(&model.GroupGameConfig{
+		rows = append(rows, model.GroupGameConfig{
 			SiteId:     resolvedSiteID,
 			Platform:   group.Platform,
 			GroupId:    group.GroupId,
@@ -486,9 +495,17 @@ func SaveOpsGroupGames(siteID string, id int, req OpsGroupGamesUpdateRequest) (*
 			Enabled:    enabled,
 			BudgetPool: budgetPool,
 			RuleJson:   ruleJSON,
-		}); err != nil {
-			return nil, err
+		})
+	}
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		for index := range rows {
+			if err := model.UpsertGroupGameConfigWithDB(tx, &rows[index]); err != nil {
+				return err
+			}
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return buildOpsGroupView(resolvedSiteID, group)
 }

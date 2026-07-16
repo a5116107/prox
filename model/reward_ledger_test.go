@@ -176,6 +176,33 @@ func TestUserCheckinByChannelUsesActivityBudgetPool(t *testing.T) {
 	require.Equal(t, 500000, fresh.Quota)
 }
 
+func TestUserCheckinByChannelUsesBackendSelectedBudgetPool(t *testing.T) {
+	setupRewardLedgerTestDB(t)
+	agent := operation_setting.GetAgentSetting()
+	agent.SiteID = "test-site"
+	agent.CommunityBudgetQuota = 1_000_000
+
+	checkinCfg := operation_setting.GetCheckinSetting()
+	checkinCfg.Enabled = true
+	checkinCfg.MinQuota = 250_000
+	checkinCfg.MaxQuota = 250_000
+
+	user := User{
+		Username: "checkin_custom_pool", Password: "Password123!", DisplayName: "checkin custom pool",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "aff-checkin-custom-pool",
+	}
+	require.NoError(t, DB.Create(&user).Error)
+
+	checkin, err := UserCheckinByChannelWithQuotaFromPool(user.Id, CheckinChannelQQ, 250_000, "community")
+	require.NoError(t, err)
+	var pool AgentBudgetPool
+	require.NoError(t, DB.Where("site_id = ? AND pool_type = ? AND budget_date = ?", "test-site", "community", checkin.CheckinDate).First(&pool).Error)
+	require.Equal(t, 250_000, pool.UsedQuota)
+	var activityPool AgentBudgetPool
+	require.NoError(t, DB.Where("site_id = ? AND pool_type = ?", "test-site", "activity").First(&activityPool).Error)
+	require.Equal(t, 0, activityPool.UsedQuota)
+}
+
 func TestUserCheckinAutoFundsConfiguredDailyBudgetOnce(t *testing.T) {
 	setupRewardLedgerTestDB(t)
 	agentCfg := operation_setting.GetAgentSetting()

@@ -30,6 +30,11 @@ func setupQuizBankTest(t *testing.T) {
 		&model.QuizQuestion{},
 		&model.QuizBankBinding{},
 		&model.QuizQuestionDraw{},
+		&model.GroupGameConfig{},
+		&model.Checkin{},
+		&model.GroupMetricsDaily{},
+		&model.Log{},
+		&model.UserQuotaTransaction{},
 		&model.AgentBudgetPool{},
 		&model.AgentBudgetTransaction{},
 		&model.OpsFundAccount{},
@@ -38,13 +43,16 @@ func setupQuizBankTest(t *testing.T) {
 
 	oldAgent := *operation_setting.GetAgentSetting()
 	oldMembership := *operation_setting.GetMembershipRiskSetting()
+	oldCheckin := *operation_setting.GetCheckinSetting()
 	t.Cleanup(func() {
 		*operation_setting.GetAgentSetting() = oldAgent
 		*operation_setting.GetMembershipRiskSetting() = oldMembership
+		*operation_setting.GetCheckinSetting() = oldCheckin
 	})
 	agentSetting := operation_setting.GetAgentSetting()
 	agentSetting.SiteID = "quiz-test"
 	agentSetting.ActivityBudgetQuota = 1_000_000
+	agentSetting.CommunityBudgetQuota = 1_000_000
 	agentSetting.DailyBudgetResetEnabled = true
 	agentSetting.DailyFundResetEnabled = true
 	membershipSetting := operation_setting.GetMembershipRiskSetting()
@@ -60,6 +68,10 @@ func setupQuizBankTest(t *testing.T) {
 func cleanupQuizBankTestRows(t *testing.T) {
 	t.Helper()
 	tables := []string{
+		"logs",
+		"group_metrics_daily",
+		"checkins",
+		"user_quota_transactions",
 		"ops_fund_ledgers",
 		"agent_budget_transactions",
 		"agent_budget_pools",
@@ -67,6 +79,7 @@ func cleanupQuizBankTestRows(t *testing.T) {
 		"quiz_question_draws",
 		"game_entries",
 		"game_rounds",
+		"group_game_configs",
 		"quiz_bank_bindings",
 		"quiz_questions",
 		"quiz_categories",
@@ -239,6 +252,85 @@ func TestQuizBindingPrecedenceAndContentHash(t *testing.T) {
 	second := QuizQuestionContentHash(" capital of france? ", []string{"Rome", "Berlin", "Paris"}, 2)
 	require.Equal(t, first, second, "semantically identical questions must deduplicate after option reordering")
 	require.NotEqual(t, first, QuizQuestionContentHash("Capital of France?", []string{"Berlin", "Paris", "Rome"}, 0))
+}
+
+func TestQuizRuntimePolicyUsesDatabaseBindingRules(t *testing.T) {
+	setupQuizBankTest(t)
+	adapterBank := seedQuizBank(t, "adapter-bank", "adapter question")
+	backendBank := seedQuizBank(t, "backend-bank", "backend question")
+	now := time.Now().Unix()
+	require.NoError(t, model.DB.Create(&model.GroupGameConfig{
+		SiteId: "quiz-test", Platform: "qq", GroupId: "room-a", GameCode: "quiz",
+		Enabled: true, BudgetPool: "activity",
+		RuleJson:  `{"reward_quota":100,"max_attempts_per_question":2,"max_per_user_day":1}`,
+		CreatedAt: now, UpdatedAt: now,
+	}).Error)
+	require.NoError(t, model.DB.Create(&model.QuizBankBinding{
+		SiteId: "quiz-test", BankId: backendBank.Id, Platform: "qq", GroupId: "room-a",
+		Enabled: true, Priority: 10,
+		RulesJson: `{"reward_quota":250,"max_attempts_per_question":3,"max_per_user_day":2,"budget_pool":"community"}`,
+		CreatedAt: now, UpdatedAt: now,
+	}).Error)
+
+	payload := quizTestPayload("database-policy")
+	payload["bank_id"] = adapterBank.Id
+	payload["reward_quota"] = 999999
+	payload["max_attempts_per_question"] = 19
+	payload["max_per_user_day"] = 999
+	payload["budget_pool"] = "ops_comp"
+	policy, err := resolveQuizRuntimePolicyTx(model.DB, "quiz-test", "qq", "room-a", payload)
+	require.NoError(t, err)
+	require.Equal(t, backendBank.Id, policy.Bank.Id)
+	require.Equal(t, 250, policy.RewardQuota)
+	require.Equal(t, 3, policy.MaxAttempts)
+	require.Equal(t, 2, policy.UserLimit)
+	require.Equal(t, "community", policy.BudgetPool)
+
+	draw, err := quizQuestionDraw(quizTestAction("database-policy"), payload)
+	require.NoError(t, err)
+	require.Equal(t, "backend question", quizResultQuestion(t, draw)["prompt"])
+	correctIndex := shownOptionIndex(t, draw, "correct-0")
+	answer, err := quizAnswerSubmit(quizTestAction("database-policy-answer"), map[string]any{
+		"draw_id": quizResultInt(t, draw, "draw_id"), "user_id": quizTestUserID,
+		"user_external_id": "qq-user-910001", "answer_index": correctIndex,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 250, quizResultInt(t, answer, "reward_quota"))
+
+	var mutation model.AgentBudgetTransaction
+	require.NoError(t, model.DB.Where("idempotency_key = ?", fmt.Sprintf("quiz-reward:%d:%d", quizResultInt(t, draw, "draw_id"), quizTestUserID)).First(&mutation).Error)
+	require.Equal(t, "community", mutation.PoolType)
+}
+
+func TestQuizQuestionSelectionHonorsWeight(t *testing.T) {
+	setupQuizBankTest(t)
+	bank := seedQuizBank(t, "weighted", "low weight", "high weight")
+	require.NoError(t, model.DB.Model(&model.QuizQuestion{}).Where("bank_id = ? AND external_key = ?", bank.Id, "weighted-1").Update("weight", 1).Error)
+	require.NoError(t, model.DB.Model(&model.QuizQuestion{}).Where("bank_id = ? AND external_key = ?", bank.Id, "weighted-2").Update("weight", 9).Error)
+
+	const scopeKey = "weighted-scope"
+	seed := ""
+	for index := 0; index < 1000; index++ {
+		candidate := fmt.Sprintf("weighted-seed-%d", index)
+		hash := quizSeedUint64(candidate + ":" + scopeKey + ":0")
+		if hash%10 > 0 && hash%2 == 0 {
+			seed = candidate
+			break
+		}
+	}
+	require.NotEmpty(t, seed)
+	selected, err := quizSelectQuestionTx(model.DB, bank.Id, scopeKey, "2026-07-16", seed)
+	require.NoError(t, err)
+	require.Equal(t, "weighted-2", selected.ExternalKey)
+}
+
+func TestQuizQuestionSelectionRejectsInvalidStoredWeight(t *testing.T) {
+	setupQuizBankTest(t)
+	bank := seedQuizBank(t, "invalid-weight", "invalid weight")
+	require.NoError(t, model.DB.Model(&model.QuizQuestion{}).Where("bank_id = ?", bank.Id).Update("weight", -1).Error)
+
+	_, err := quizSelectQuestionTx(model.DB, bank.Id, "invalid-weight-scope", "2026-07-16", "seed")
+	require.ErrorContains(t, err, "no published questions")
 }
 
 func TestOpsQuizBindingCanChangePlatformAndGroup(t *testing.T) {

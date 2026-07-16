@@ -26,7 +26,7 @@ type GroupGameConfig struct {
 	Platform   string `json:"platform" gorm:"type:varchar(32);not null;uniqueIndex:ux_group_game_config;index"`
 	GroupId    string `json:"group_id" gorm:"type:varchar(128);not null;uniqueIndex:ux_group_game_config;index"`
 	GameCode   string `json:"game_code" gorm:"type:varchar(64);not null;uniqueIndex:ux_group_game_config;index"`
-	Enabled    bool   `json:"enabled" gorm:"not null;default:true"`
+	Enabled    bool   `json:"enabled" gorm:"not null"`
 	BudgetPool string `json:"budget_pool" gorm:"type:varchar(32);not null;default:game"`
 	RuleJson   string `json:"rule_json" gorm:"type:text"`
 	CreatedAt  int64  `json:"created_at" gorm:"index"`
@@ -41,9 +41,9 @@ type GroupChatOpsConfig struct {
 	SiteId                string `json:"site_id" gorm:"type:varchar(64);not null;uniqueIndex:ux_group_chatops_config;index"`
 	Platform              string `json:"platform" gorm:"type:varchar(32);not null;uniqueIndex:ux_group_chatops_config;index"`
 	GroupId               string `json:"group_id" gorm:"type:varchar(128);not null;uniqueIndex:ux_group_chatops_config;index"`
-	CheckinEnabled        bool   `json:"checkin_enabled" gorm:"not null;default:true"`
-	VerifyEnabled         bool   `json:"verify_enabled" gorm:"not null;default:true"`
-	InviteEnabled         bool   `json:"invite_enabled" gorm:"not null;default:true"`
+	CheckinEnabled        bool   `json:"checkin_enabled" gorm:"not null"`
+	VerifyEnabled         bool   `json:"verify_enabled" gorm:"not null"`
+	InviteEnabled         bool   `json:"invite_enabled" gorm:"not null"`
 	CheckinQuota          int    `json:"checkin_quota" gorm:"not null;default:0"`
 	VerifyMinQuota        int    `json:"verify_min_quota" gorm:"not null;default:1"`
 	InviteRewardQuota     int    `json:"invite_reward_quota" gorm:"not null;default:0"`

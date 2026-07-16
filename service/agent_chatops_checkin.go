@@ -176,28 +176,38 @@ func chatOpsBool(value any) bool {
 	return false
 }
 
-func chatOpsCheckinRule(cfg *model.GroupChatOpsConfig) (*model.CheckinRule, int, bool) {
-	if cfg == nil {
-		return nil, 0, false
+func chatOpsCheckinRule(cfg *model.GroupChatOpsConfig, policy effectiveGroupGamePolicy) (*model.CheckinRule, int, bool, string, error) {
+	checkin := policy.Rules
+	if checkin == nil {
+		checkin = map[string]any{}
 	}
-	rules := chatOpsJSONMap(cfg.RuleJson)
-	checkin := chatOpsNestedMap(rules["checkin"])
+	if cfg != nil {
+		rules := chatOpsJSONMap(cfg.RuleJson)
+		checkin = mergeGamePolicyMaps(checkin, chatOpsNestedMap(rules["checkin"]))
+	}
 	rule := &model.CheckinRule{
-		FixedQuota: cfg.CheckinQuota,
+		FixedQuota: 0,
 		RewardMin:  chatOpsFirstInt(checkin["reward_min"]),
 		RewardMax:  chatOpsFirstInt(checkin["reward_max"]),
 		BonusDays:  chatOpsFirstInt(checkin["bonus_days"]),
 		BonusExtra: chatOpsFirstInt(checkin["bonus_extra"]),
 	}
+	if cfg != nil {
+		rule.FixedQuota = cfg.CheckinQuota
+	}
 	if rule.FixedQuota <= 0 {
 		rule.FixedQuota = chatOpsFirstInt(checkin["checkin_quota"], checkin["quota"], checkin["fixed_quota"])
 	}
-	dailyLimit := cfg.DailyGroupRewardLimit
+	dailyLimit := 0
+	if cfg != nil {
+		dailyLimit = cfg.DailyGroupRewardLimit
+	}
 	if dailyLimit <= 0 {
 		dailyLimit = chatOpsFirstInt(checkin["daily_group_reward_limit"], checkin["daily_reward_limit"])
 	}
 	requireVerify := chatOpsBool(checkin["require_verify"])
-	return rule, dailyLimit, requireVerify
+	pool, err := effectivePolicyBudgetPool(policy, checkin, "activity")
+	return rule, dailyLimit, requireVerify, pool, err
 }
 
 func chatOpsCheckinBudgetExceeded(source string, roomID string, limit int, incoming int) bool {
@@ -296,7 +306,11 @@ func HandleAgentChatOpsCheckin(req AgentChatOpsRequest) AgentChatOpsCheckinResul
 	display := firstNonEmptyAgent(req.Username, req.UserExternalID)
 
 	cfg, hasGroupCfg := chatOpsGroupConfig(req)
-	if hasGroupCfg && !cfg.CheckinEnabled {
+	gamePolicy, policyErr := resolveEffectiveGroupGamePolicyTx(model.DB, AgentSiteID(), req.Source, req.RoomID, "checkin")
+	if policyErr != nil {
+		return AgentChatOpsCheckinResult{Success: false, Channel: channel, Reply: fmt.Sprintf("@%s 签到配置读取失败，请稍后重试。", display)}
+	}
+	if (hasGroupCfg && !cfg.CheckinEnabled) || (gamePolicy.Found && !gamePolicy.Enabled) {
 		return AgentChatOpsCheckinResult{
 			Success: false, Channel: channel,
 			Reply: fmt.Sprintf("@%s 本群签到暂未开启，请关注管理员公告。", display),
@@ -327,8 +341,13 @@ func HandleAgentChatOpsCheckin(req AgentChatOpsRequest) AgentChatOpsCheckinResul
 	var checkinRule *model.CheckinRule
 	dailyLimit := 0
 	requireVerify := false
-	if hasGroupCfg {
-		checkinRule, dailyLimit, requireVerify = chatOpsCheckinRule(cfg)
+	budgetPool := "activity"
+	if hasGroupCfg || gamePolicy.Found {
+		var ruleErr error
+		checkinRule, dailyLimit, requireVerify, budgetPool, ruleErr = chatOpsCheckinRule(cfg, gamePolicy)
+		if ruleErr != nil {
+			return AgentChatOpsCheckinResult{Success: false, UserBound: true, NewAPIUserID: identity.NewAPIUserID, Channel: channel, Reply: fmt.Sprintf("@%s 签到预算配置有误，请联系管理员。", display)}
+		}
 	}
 	if requireVerify && !identity.UserBound {
 		return AgentChatOpsCheckinResult{
@@ -346,7 +365,7 @@ func HandleAgentChatOpsCheckin(req AgentChatOpsRequest) AgentChatOpsCheckinResul
 			Action:     "checkin",
 			Status:     "failed",
 			Group:      channel,
-			BudgetPool: "activity",
+			BudgetPool: budgetPool,
 			Other: map[string]interface{}{
 				"checkin": map[string]interface{}{
 					"channel": channel,
@@ -384,13 +403,13 @@ func HandleAgentChatOpsCheckin(req AgentChatOpsRequest) AgentChatOpsCheckinResul
 			Reply:        fmt.Sprintf("@%s 本群今日签到奖励池已发完，请明天再来。", display),
 		}
 	}
-	checkin, err := model.UserCheckinByChannelWithQuota(identity.NewAPIUserID, channel, preview.QuotaAwarded)
+	checkin, err := model.UserCheckinByChannelWithQuotaFromPool(identity.NewAPIUserID, channel, preview.QuotaAwarded, budgetPool)
 	if err != nil {
 		recordChatOpsActionLog(req, identity, model.LogTypeSystem, "chatops checkin failed", model.LogEventOptions{
 			Action:     "checkin",
 			Status:     "failed",
 			Group:      channel,
-			BudgetPool: "activity",
+			BudgetPool: budgetPool,
 			Other: map[string]interface{}{
 				"checkin": map[string]interface{}{
 					"channel": channel,
@@ -421,7 +440,7 @@ func HandleAgentChatOpsCheckin(req AgentChatOpsRequest) AgentChatOpsCheckinResul
 		Action:     "checkin",
 		Status:     "success",
 		Group:      channel,
-		BudgetPool: "activity",
+		BudgetPool: budgetPool,
 		RewardType: "checkin_" + channel,
 		Other: map[string]interface{}{
 			"checkin": map[string]interface{}{

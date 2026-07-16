@@ -148,10 +148,8 @@ class BudgetChecker:
         return True, ""
 
     def check_user_limit(self, uid, amount, pool="game", platform=None):
-        pk = self._pk(pool, platform)
-        spent = self._user.get(uid, {}).get(pk, 0)
-        if spent + amount > USER_DAILY_LIMIT:
-            return False, "今日额度已用完，明天再来"
+        # The Go settlement transaction is authoritative for per-user and pool
+        # limits. Local counters are process-scoped and remain reporting-only.
         return True, ""
 
     def deduct(self, uid, amount, pool="game", platform=None):

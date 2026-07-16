@@ -43,6 +43,7 @@ func TestQuizDrawConcurrentPostgres(t *testing.T) {
 		&model.QuizQuestion{},
 		&model.QuizBankBinding{},
 		&model.QuizQuestionDraw{},
+		&model.GroupGameConfig{},
 		&model.AgentBudgetPool{},
 		&model.AgentBudgetTransaction{},
 		&model.OpsFundAccount{},

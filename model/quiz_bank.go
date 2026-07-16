@@ -55,7 +55,7 @@ type QuizBankBinding struct {
 	BankId    int    `json:"bank_id" gorm:"not null;index"`
 	Platform  string `json:"platform" gorm:"type:varchar(32);not null;uniqueIndex:ux_quiz_bank_binding,priority:2;index"`
 	GroupId   string `json:"group_id" gorm:"type:varchar(128);not null;uniqueIndex:ux_quiz_bank_binding,priority:3;index"`
-	Enabled   bool   `json:"enabled" gorm:"not null;default:true;index"`
+	Enabled   bool   `json:"enabled" gorm:"not null;index"`
 	Priority  int    `json:"priority" gorm:"not null;default:0"`
 	RulesJson string `json:"rules_json" gorm:"type:text"`
 	CreatedAt int64  `json:"created_at" gorm:"index"`

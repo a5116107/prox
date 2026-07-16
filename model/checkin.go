@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -291,7 +292,17 @@ func UserCheckinByChannel(userId int, channel string) (*Checkin, error) {
 // UserCheckinByChannelWithQuota supports a group-level fixed quota override.
 // quotaOverride<=0 keeps the site/channel random quota rule.
 func UserCheckinByChannelWithQuota(userId int, channel string, quotaOverride int) (*Checkin, error) {
+	return UserCheckinByChannelWithQuotaFromPool(userId, channel, quotaOverride, "activity")
+}
+
+// UserCheckinByChannelWithQuotaFromPool settles a check-in against the
+// backend-resolved pool while preserving the existing channel rules.
+func UserCheckinByChannelWithQuotaFromPool(userId int, channel string, quotaOverride int, poolType string) (*Checkin, error) {
 	channel = normalizeCheckinChannel(channel)
+	poolType = strings.ToLower(strings.TrimSpace(poolType))
+	if err := ValidateOpsPoolType(poolType); err != nil {
+		return nil, err
+	}
 	setting := operation_setting.GetCheckinSetting()
 	if !setting.Enabled {
 		return nil, errors.New("签到功能未启用")
@@ -343,9 +354,9 @@ func UserCheckinByChannelWithQuota(userId int, channel string, quotaOverride int
 	}
 
 	if common.UsingSQLite {
-		return userCheckinWithoutTransaction(checkin, userId, quotaAwarded, channel)
+		return userCheckinWithoutTransaction(checkin, userId, quotaAwarded, channel, poolType)
 	}
-	return userCheckinWithTransaction(checkin, userId, quotaAwarded, channel)
+	return userCheckinWithTransaction(checkin, userId, quotaAwarded, channel, poolType)
 }
 
 // CountTotalCheckinDays 用户所有渠道累计签到天数（去重日期）。
@@ -411,7 +422,7 @@ func UserCheckin(userId int) (*Checkin, error) {
 }
 
 // userCheckinWithTransaction 使用事务执行签到（适用于 MySQL 和 PostgreSQL）
-func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int, channel string) (*Checkin, error) {
+func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int, channel string, poolType string) (*Checkin, error) {
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		// 步骤1: 创建签到记录
 		// 数据库唯一约束 (user_id, checkin_date, channel) 防止并发重复签到
@@ -420,7 +431,7 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int, 
 		}
 
 		// 步骤2: 在事务中扣减统一活动奖池并增加用户额度
-		if err := grantCheckinQuotaFromBudgetTx(tx, userId, quotaAwarded, channel, checkin.CheckinDate); err != nil {
+		if err := grantCheckinQuotaFromBudgetTx(tx, userId, quotaAwarded, channel, checkin.CheckinDate, poolType); err != nil {
 			if errors.Is(err, ErrBudgetPoolQuotaInsufficient) {
 				return errors.New("今日签到奖励池已发完，请明天再来")
 			}
@@ -445,15 +456,15 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int, 
 }
 
 // userCheckinWithoutTransaction 不使用事务执行签到（适用于 SQLite）
-func userCheckinWithoutTransaction(checkin *Checkin, userId int, quotaAwarded int, channel string) (*Checkin, error) {
-	return userCheckinWithTransaction(checkin, userId, quotaAwarded, channel)
+func userCheckinWithoutTransaction(checkin *Checkin, userId int, quotaAwarded int, channel string, poolType string) (*Checkin, error) {
+	return userCheckinWithTransaction(checkin, userId, quotaAwarded, channel, poolType)
 }
 
-func grantCheckinQuotaFromBudgetTx(tx *gorm.DB, userId int, quotaAwarded int, channel string, checkinDate string) error {
+func grantCheckinQuotaFromBudgetTx(tx *gorm.DB, userId int, quotaAwarded int, channel string, checkinDate string, poolType string) error {
 	idem := fmt.Sprintf("checkin:%s:%d:%s", normalizeCheckinChannel(channel), userId, checkinDate)
 	remark := fmt.Sprintf("checkin reward channel=%s user_id=%d date=%s", normalizeCheckinChannel(channel), userId, checkinDate)
 	metadata := fmt.Sprintf(`{"settlement_id":%q,"channel":%q,"checkin_date":%q,"user_id":%d,"source_type":"checkin_reward"}`, idem, normalizeCheckinChannel(channel), checkinDate, userId)
-	return GrantQuotaFromBudgetPoolWithSourceTx(tx, userId, "activity", quotaAwarded, idem, remark, "checkin_reward", metadata)
+	return GrantQuotaFromBudgetPoolWithSourceTx(tx, userId, poolType, quotaAwarded, idem, remark, "checkin_reward", metadata)
 }
 
 // GetUserCheckinStatsByChannel 获取用户某渠道的签到统计信息

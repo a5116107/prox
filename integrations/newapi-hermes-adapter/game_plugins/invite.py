@@ -132,12 +132,8 @@ class InviteGame(GamePlugin):
             aff_link = data.get("invite_url") or aff_link
         except Exception as e:
             return GameResponse.quick(f"@{ctx.username} 邀请链接生成失败：{e}")
-        inviter_r = budget.quota_to_usd(
-            int(self.config.get("inviter_reward_quota", 1500000) or 0)
-        )
-        invitee_r = budget.quota_to_usd(
-            int(self.config.get("invitee_reward_quota", 750000) or 0)
-        )
+        inviter_r = budget.quota_to_usd(int(data.get("inviter_reward_quota") or 0))
+        invitee_r = budget.quota_to_usd(int(data.get("invitee_reward_quota") or 0))
         return GameResponse.quick(
             f"@{ctx.username} 🔗 你的邀请链接:\n\n{aff_link}\n\n"
             f"好友通过链接注册或由你拉入群后，完成「验牌」即自动结算。\n"

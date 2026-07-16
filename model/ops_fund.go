@@ -461,6 +461,10 @@ func validOpsPoolType(poolType string) error {
 	return errors.New("unknown pool type: " + poolType)
 }
 
+func ValidateOpsPoolType(poolType string) error {
+	return validOpsPoolType(strings.ToLower(strings.TrimSpace(poolType)))
+}
+
 func quotaReplayFieldsFromMetadata(idempotencyKey string, metadataJson string, defaultMutationIndex int) (string, int, int) {
 	settlementID := ""
 	mutationIndex := defaultMutationIndex

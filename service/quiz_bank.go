@@ -29,12 +29,85 @@ func executeQuizAnswerSubmit(action *model.AgentAction, payload map[string]any) 
 	return quizAnswerSubmit(action, payload)
 }
 
+type quizRuntimePolicy struct {
+	Bank           model.QuizBank
+	ScopeMode      string
+	TTLSeconds     int
+	MaxAttempts    int
+	RewardQuota    int
+	GroupLimit     int
+	UserLimit      int
+	BudgetPool     string
+	CloseOnCorrect bool
+	MaxWinners     int
+	Rules          map[string]any
+}
+
+func resolveQuizRuntimePolicyTx(tx *gorm.DB, siteID, platform, groupID string, payload map[string]any) (quizRuntimePolicy, error) {
+	policy := quizRuntimePolicy{}
+	gamePolicy, err := resolveEffectiveGroupGamePolicyTx(tx, siteID, platform, groupID, "quiz")
+	if err != nil {
+		return policy, err
+	}
+	if gamePolicy.Found && !gamePolicy.Enabled {
+		return policy, errors.New("quiz is disabled for this group")
+	}
+
+	rules := map[string]any{}
+	if gamePolicy.Found {
+		rules = mergeGamePolicyMaps(rules, gamePolicy.Rules)
+	} else {
+		// Compatibility for old rows while they are migrated to group_game_configs.
+		rules = mergeGamePolicyMaps(rules, payload)
+	}
+	bank, binding, bindingFound, err := quizResolveBankAndBindingTx(tx, siteID, platform, groupID, payload, gamePolicy)
+	if err != nil {
+		return policy, err
+	}
+	if bindingFound {
+		bindingRules := map[string]any{}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(binding.RulesJson)), &bindingRules); err != nil && strings.TrimSpace(binding.RulesJson) != "" {
+			return policy, fmt.Errorf("quiz binding rules are invalid: %w", err)
+		}
+		rules = mergeGamePolicyMaps(rules, bindingRules)
+	}
+
+	scopeMode := strings.ToLower(firstAgentNonEmpty(gamePolicyString(rules, "question_scope"), gamePolicyString(rules, "scope_mode"), "per_user"))
+	if scopeMode == "group" || scopeMode == "shared" || scopeMode == "room" {
+		scopeMode = "per_group"
+	}
+	if scopeMode != "per_group" {
+		scopeMode = "per_user"
+	}
+	pool, err := effectivePolicyBudgetPool(gamePolicy, rules, "activity")
+	if err != nil {
+		return policy, err
+	}
+	policy = quizRuntimePolicy{
+		Bank: bank, ScopeMode: scopeMode,
+		TTLSeconds:     quizBoundedInt(rules, 600, 60, 86400, "question_ttl_seconds", "ttl_seconds"),
+		MaxAttempts:    quizBoundedInt(rules, 2, 1, 20, "max_attempts_per_question", "max_attempts"),
+		RewardQuota:    quizBoundedInt(rules, 100000, 0, 1000000000, "reward_quota", "quota"),
+		GroupLimit:     quizBoundedInt(rules, 0, 0, 100000, "quiz_limit_per_group", "question_count"),
+		UserLimit:      quizBoundedInt(rules, 10, 0, 100000, "max_per_user_day"),
+		BudgetPool:     pool,
+		CloseOnCorrect: quizMapBool(rules, "close_on_correct") || scopeMode != "per_group",
+		MaxWinners:     quizBoundedInt(rules, 0, 0, 100000, "max_winners_per_question", "max_winners"),
+		Rules:          rules,
+	}
+	return policy, nil
+}
+
 func quizQuestionDraw(action *model.AgentAction, payload map[string]any) (map[string]any, error) {
 	now := time.Now()
 	siteID := AgentSiteID()
 	platform := agentQuizPlatform(payload)
 	groupID := agentQuizGroupID(payload)
-	scopeMode := agentQuizScopeMode(payload)
+	runtimePolicy, err := resolveQuizRuntimePolicyTx(model.DB, siteID, platform, groupID, payload)
+	if err != nil {
+		return nil, err
+	}
+	scopeMode := runtimePolicy.ScopeMode
 	userID := int(agentPayloadFloat(payload, "user_id", "new_api_user_id", "resolved_new_api_user_id"))
 	externalUserID := firstAgentNonEmpty(agentPayloadString(payload, "target_external_id", "external_user_id", "user_external_id"), action.TargetId)
 	scopeKey := quizScopeKey(platform, groupID, scopeMode, userID, externalUserID)
@@ -43,21 +116,21 @@ func quizQuestionDraw(action *model.AgentAction, payload map[string]any) (map[st
 	if drawKey == "" {
 		drawKey = quizStableKey(siteID, scopeKey, strconv.FormatInt(now.UnixNano(), 10))
 	}
-	ttlSeconds := quizBoundedInt(payload, 600, 60, 86400, "question_ttl_seconds", "ttl_seconds")
-	maxAttempts := quizBoundedInt(payload, 2, 1, 20, "max_attempts_per_question", "max_attempts")
-	rewardQuota := quizBoundedInt(payload, 100000, 0, 1000000000, "reward_quota", "quota")
-	groupLimit := quizBoundedInt(payload, 0, 0, 100000, "quiz_limit_per_group", "question_count")
-	userLimit := quizBoundedInt(payload, 10, 0, 100000, "max_per_user_day")
+	ttlSeconds := runtimePolicy.TTLSeconds
+	maxAttempts := runtimePolicy.MaxAttempts
+	rewardQuota := runtimePolicy.RewardQuota
+	groupLimit := runtimePolicy.GroupLimit
+	userLimit := runtimePolicy.UserLimit
 	rules := map[string]any{
 		"max_attempts":     maxAttempts,
 		"reward_quota":     rewardQuota,
-		"budget_pool":      firstAgentNonEmpty(agentPayloadString(payload, "budget_pool", "pool"), "activity"),
-		"close_on_correct": agentBoolPayload(payload, "close_on_correct") || scopeMode != "per_group",
-		"max_winners":      quizBoundedInt(payload, 0, 0, 100000, "max_winners_per_question", "max_winners"),
+		"budget_pool":      runtimePolicy.BudgetPool,
+		"close_on_correct": runtimePolicy.CloseOnCorrect,
+		"max_winners":      runtimePolicy.MaxWinners,
 	}
 
 	var result map[string]any
-	err := model.DB.Transaction(func(tx *gorm.DB) error {
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		if existing, err := quizFindActiveDrawTx(tx, siteID, scopeKey, now.Unix()); err == nil {
 			if err := quizEnsureEntryTx(tx, siteID, existing.RoundId, userID, externalUserID, now.Unix()); err != nil {
 				return err
@@ -68,6 +141,24 @@ func quizQuestionDraw(action *model.AgentAction, payload map[string]any) (map[st
 			return err
 		}
 
+		bank := runtimePolicy.Bank
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", bank.Id).First(&bank).Error; err != nil {
+			return err
+		}
+		// A concurrent draw can commit while this transaction waits for the bank
+		// lock. Recheck after acquiring it so a scope has only one open round.
+		if existing, err := quizFindActiveDrawTx(tx, siteID, scopeKey, now.Unix()); err == nil {
+			if err := quizEnsureEntryTx(tx, siteID, existing.RoundId, userID, externalUserID, now.Unix()); err != nil {
+				return err
+			}
+			result, err = quizDrawResponseTx(tx, existing, userID, externalUserID)
+			return err
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		// The bank row serializes draws that share a question bank. Limits must be
+		// checked after acquiring it, otherwise concurrent users can all observe
+		// the same pre-limit count and overrun the configured daily cap.
 		if userLimit > 0 {
 			count, err := quizTodayUserRoundsTx(tx, siteID, platform, groupID, userID, externalUserID, businessDate)
 			if err != nil {
@@ -85,25 +176,6 @@ func quizQuestionDraw(action *model.AgentAction, payload map[string]any) (map[st
 			if count >= int64(groupLimit) {
 				return fmt.Errorf("quiz group daily limit reached: %d", groupLimit)
 			}
-		}
-
-		bank, err := quizResolveBankTx(tx, siteID, platform, groupID, payload)
-		if err != nil {
-			return err
-		}
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", bank.Id).First(&bank).Error; err != nil {
-			return err
-		}
-		// A concurrent draw can commit while this transaction waits for the bank
-		// lock. Recheck after acquiring it so a scope has only one open round.
-		if existing, err := quizFindActiveDrawTx(tx, siteID, scopeKey, now.Unix()); err == nil {
-			if err := quizEnsureEntryTx(tx, siteID, existing.RoundId, userID, externalUserID, now.Unix()); err != nil {
-				return err
-			}
-			result, err = quizDrawResponseTx(tx, existing, userID, externalUserID)
-			return err
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
 		}
 		question, err := quizSelectQuestionTx(tx, bank.Id, scopeKey, businessDate, drawKey)
 		if err != nil {
@@ -332,15 +404,16 @@ func quizAnswerSubmit(action *model.AgentAction, payload map[string]any) (map[st
 }
 
 func quizResolveBankTx(tx *gorm.DB, siteID, platform, groupID string, payload map[string]any) (model.QuizBank, error) {
+	gamePolicy, err := resolveEffectiveGroupGamePolicyTx(tx, siteID, platform, groupID, "quiz")
+	if err != nil {
+		return model.QuizBank{}, err
+	}
+	bank, _, _, err := quizResolveBankAndBindingTx(tx, siteID, platform, groupID, payload, gamePolicy)
+	return bank, err
+}
+
+func quizResolveBankAndBindingTx(tx *gorm.DB, siteID, platform, groupID string, payload map[string]any, gamePolicy effectiveGroupGamePolicy) (model.QuizBank, model.QuizBankBinding, bool, error) {
 	var bank model.QuizBank
-	bankID := int(agentPayloadFloat(payload, "bank_id"))
-	bankCode := strings.TrimSpace(agentPayloadString(payload, "bank_code"))
-	if bankID > 0 {
-		return bank, tx.Where("id = ? AND site_id = ? AND status = ?", bankID, siteID, "published").First(&bank).Error
-	}
-	if bankCode != "" {
-		return bank, tx.Where("site_id = ? AND code = ? AND status = ?", siteID, bankCode, "published").First(&bank).Error
-	}
 	var binding model.QuizBankBinding
 	err := tx.Raw(`
 		SELECT * FROM quiz_bank_bindings
@@ -356,13 +429,35 @@ func quizResolveBankTx(tx *gorm.DB, siteID, platform, groupID string, payload ma
 	}
 	if err == nil {
 		err = tx.Where("id = ? AND site_id = ? AND status = ?", binding.BankId, siteID, "published").First(&bank).Error
-		return bank, err
+		return bank, binding, true, err
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return bank, err
+		return bank, binding, false, err
+	}
+
+	bankID, hasBankID := gamePolicyInt(gamePolicy.Rules, "bank_id")
+	bankCode := gamePolicyString(gamePolicy.Rules, "bank_code")
+	if !gamePolicy.Found {
+		if !hasBankID {
+			bankID = int(agentPayloadFloat(payload, "bank_id"))
+		}
+		if bankCode == "" {
+			bankCode = strings.TrimSpace(agentPayloadString(payload, "bank_code"))
+		}
+	}
+	if bankID > 0 {
+		err = tx.Where("id = ? AND site_id = ? AND status = ?", bankID, siteID, "published").First(&bank).Error
+		return bank, binding, false, err
+	}
+	if bankCode != "" {
+		err = tx.Where("site_id = ? AND code = ? AND status = ?", siteID, bankCode, "published").First(&bank).Error
+		return bank, binding, false, err
+	}
+	if gamePolicy.Found {
+		return bank, binding, false, errors.New("quiz has no published question bank bound to this group")
 	}
 	err = tx.Where("site_id = ? AND status = ?", siteID, "published").Order("id asc").First(&bank).Error
-	return bank, err
+	return bank, binding, false, err
 }
 
 func quizSelectQuestionTx(tx *gorm.DB, bankID int, scopeKey, businessDate, seed string) (model.QuizQuestion, error) {
@@ -390,8 +485,29 @@ func quizSelectQuestionTx(tx *gorm.DB, bankID int, scopeKey, businessDate, seed 
 	if len(candidates) == 0 {
 		candidates = questions
 	}
-	index := int(quizSeedUint64(seed+":"+scopeKey+":"+strconv.Itoa(len(used))) % uint64(len(candidates)))
-	return candidates[index], nil
+	totalWeight := uint64(0)
+	for _, question := range candidates {
+		if question.Weight <= 0 {
+			return model.QuizQuestion{}, fmt.Errorf("quiz question %d has invalid weight", question.Id)
+		}
+		weight := uint64(question.Weight)
+		if ^uint64(0)-totalWeight < weight {
+			return model.QuizQuestion{}, errors.New("quiz question weights overflow")
+		}
+		totalWeight += weight
+	}
+	if totalWeight == 0 {
+		return model.QuizQuestion{}, errors.New("quiz bank has no weighted questions")
+	}
+	ticket := quizSeedUint64(seed+":"+scopeKey+":"+strconv.Itoa(len(used))) % totalWeight
+	for _, question := range candidates {
+		weight := uint64(question.Weight)
+		if ticket < weight {
+			return question, nil
+		}
+		ticket -= weight
+	}
+	return model.QuizQuestion{}, errors.New("quiz weighted selection failed")
 }
 
 func quizFindActiveDrawTx(tx *gorm.DB, siteID, scopeKey string, now int64) (*model.QuizQuestionDraw, error) {

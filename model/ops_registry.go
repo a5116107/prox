@@ -1,6 +1,8 @@
 package model
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -138,9 +140,26 @@ func UpsertGroupGameConfigWithDB(db *gorm.DB, row *GroupGameConfig) error {
 		return gorm.ErrInvalidData
 	}
 	row.SiteId = CanonicalSiteID(row.SiteId)
-	row.Platform = strings.TrimSpace(row.Platform)
+	row.Platform = strings.ToLower(strings.TrimSpace(row.Platform))
 	row.GroupId = strings.TrimSpace(row.GroupId)
-	row.GameCode = strings.TrimSpace(row.GameCode)
+	row.GameCode = strings.ToLower(strings.TrimSpace(row.GameCode))
+	row.BudgetPool = strings.ToLower(strings.TrimSpace(row.BudgetPool))
+	if row.Platform == "" || row.GameCode == "" {
+		return errors.New("platform and game_code are required")
+	}
+	if row.BudgetPool == "" {
+		row.BudgetPool = "game"
+	}
+	if err := ValidateOpsPoolType(row.BudgetPool); err != nil {
+		return err
+	}
+	if strings.TrimSpace(row.RuleJson) == "" {
+		row.RuleJson = "{}"
+	}
+	var rules map[string]any
+	if err := json.Unmarshal([]byte(row.RuleJson), &rules); err != nil || rules == nil {
+		return errors.New("rule_json must be a JSON object")
+	}
 	now := time.Now().Unix()
 	if row.CreatedAt == 0 {
 		row.CreatedAt = now
