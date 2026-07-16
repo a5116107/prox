@@ -1,5 +1,32 @@
 # Development
 
+## Source of truth and local layout
+
+GitHub `a5116107/prox` is the only source remote. Start every task from the
+current `origin/main`; production hosts are release targets, not Git remotes or
+places to develop code.
+
+The canonical Windows checkout is:
+
+```text
+H:\Root\jiaoben\zhongzhuang\prox\source
+```
+
+Use sibling worktrees under `_worktrees/` for isolated tasks. Before creating a
+branch, verify the canonical checkout and remote:
+
+```bash
+git remote -v
+git fetch origin --prune
+git status --short --branch
+git rev-parse HEAD
+git rev-parse origin/main
+```
+
+Only `origin` may be listed, and a release branch must be based on the expected
+`origin/main` commit. Runtime data, host snapshots, generated frontend output,
+Python environments, and `node_modules` stay outside commits.
+
 ## Toolchain
 
 - Go version from `go.mod`
@@ -17,6 +44,15 @@ docker compose up -d postgres redis
 ```
 
 Run the Go API directly with `go run .`, or build the complete development image with `docker compose up -d --build`.
+
+On Windows, Bun must use a hoisted workspace layout. If the default hardlink
+backend is unavailable on the checkout volume, use the copy backend without
+changing the lockfile:
+
+```powershell
+cd web
+bun install --frozen-lockfile --linker=hoisted --backend=copyfile
+```
 
 For Adapter development:
 

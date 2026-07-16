@@ -14,6 +14,30 @@ docker system df
 
 Review Nginx status counts, API latency, upstream 429s, Bot action failures, budget pool balance, and risk-control audit events.
 
+## Runtime source verification
+
+Host source and build output are supporting evidence only. Confirm the active
+container, embedded release marker, live routes, and separate Adapter service:
+
+```bash
+git -C /opt/prox/current remote -v
+git -C /opt/prox/current status --short --branch
+git -C /opt/prox/current rev-parse HEAD
+docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
+docker inspect new-api --format '{{json .Mounts}}'
+curl -fsS http://127.0.0.1:3000/release-marker.txt
+curl -fsS http://127.0.0.1:3000/api/status
+systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
+curl -fsS http://127.0.0.1:18181/health
+docker exec new-api sh -c 'wget -qO- http://host.docker.internal:18181/health'
+```
+
+Expected ownership is `/opt/prox/current` for release source,
+`/opt/prox/venv` for the Adapter environment, `/etc/prox/hermes.env` for
+Adapter secrets, and `/var/lib/prox-hermes` for Adapter state. A host-side
+`web/default/dist` change has no production effect until a tagged image is
+built and `new-api` is recreated.
+
 ## Backups
 
 - PostgreSQL: daily custom-format dump, encrypted off-host copy, retention test.

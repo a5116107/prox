@@ -1,5 +1,13 @@
 # Deployment
 
+## Release source
+
+Production releases are built only from a clean checkout of
+`https://github.com/a5116107/prox.git`. The production host does not own a Git
+upstream and must not receive commits directly. `/opt/prox/current` is the
+release checkout; the immutable `new-api` image is the deployed backend and
+frontend unit.
+
 ## Host layout
 
 ```text
@@ -63,12 +71,20 @@ For the first release, set `SKIP_ADAPTER_CHECK=1` only while bootstrapping Adapt
 
 ```bash
 docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} {{.RestartCount}}'
+git -C /opt/prox/current remote -v
+git -C /opt/prox/current status --short --branch
+git -C /opt/prox/current rev-parse HEAD
 curl -fsS http://127.0.0.1:3000/api/status
 curl -fsS http://127.0.0.1:3000/release-marker.txt
 curl -fsS http://127.0.0.1:18181/health
+systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
 ```
 
-The image tag and marker must match the release metadata under `releases/current.env`.
+The checkout must list only GitHub as `origin`. The image tag, image ID, commit,
+and marker must match the release metadata under `releases/current.env`.
+Adapter `FragmentPath` must resolve to `prox-hermes-adapter.service`, its
+environment file to `/etc/prox/hermes.env`, its user to `prox`, and its restart
+count must remain stable.
 
 ## Firewall
 
