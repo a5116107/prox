@@ -374,6 +374,7 @@ wait_newapi() {
 switch_newapi_image() {
   local image="$1"
   set_env_value "$ENV_FILE" NEWAPI_IMAGE "$image"
+  export NEWAPI_IMAGE="$image"
   compose up -d --no-deps --force-recreate new-api
 }
 

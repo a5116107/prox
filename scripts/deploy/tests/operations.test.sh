@@ -58,6 +58,18 @@ ALLOW_LEGACY_QUIZ_ROUTE=0 assert_failure "legacy quiz route accepted during rele
 ALLOW_LEGACY_QUIZ_ROUTE=1 assert_success "legacy quiz route rejected during rollback" \
   quiz_route_status_is_acceptable 404
 
+(
+  set_env_value() { :; }
+  compose() {
+    assert_equal "prox-new-api:candidate" "$NEWAPI_IMAGE" \
+      "Compose process environment retained the previous image"
+    assert_equal "up -d --no-deps --force-recreate new-api" "$*" \
+      "image switch Compose arguments"
+  }
+  export NEWAPI_IMAGE="prox-new-api:previous"
+  switch_newapi_image "prox-new-api:candidate"
+)
+
 printf '%s' '{"success":true}' | json_success_response || fail "valid status response rejected"
 if printf '%s' '{"success":false}' | json_success_response; then
   fail "failed status response accepted"
