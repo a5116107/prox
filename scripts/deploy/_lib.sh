@@ -207,7 +207,7 @@ extract_static_asset() {
 }
 
 check_newapi_static_assets() {
-  local base_url="${1:-http://127.0.0.1:3000}" html asset
+  local base_url="http://127.0.0.1:3000" html asset
   curl --fail --silent --show-error --max-time 5 --output /dev/null \
     "$base_url/favicon.ico" || return 1
   html="$(curl --fail --silent --show-error --max-time 5 "$base_url/")" || return 1
@@ -218,7 +218,7 @@ check_newapi_static_assets() {
 }
 
 check_agent_image_config() {
-  local base_url="${1:-http://127.0.0.1:3000}" status adapter_auth_value body
+  local base_url="http://127.0.0.1:3000" status adapter_auth_value body
   status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
     --max-time 5 "$base_url/api/agent/chatops/image-config?source=qq" || true)"
   case "$status" in
