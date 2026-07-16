@@ -142,6 +142,15 @@ func normalizeOptionUpdateValue(value any) string {
 }
 
 func validateOptionUpdate(c *gin.Context, key string, value string) bool {
+	if strings.HasPrefix(key, "agent_setting.image_") {
+		if err := operation_setting.ValidateAgentImageOption(key, value); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return false
+		}
+	}
 	switch key {
 	case "QuotaForInviter", "QuotaForInvitee":
 		if isPositiveOptionValue(value) && !operation_setting.IsPaymentComplianceConfirmed() {

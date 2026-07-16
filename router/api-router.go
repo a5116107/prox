@@ -72,6 +72,7 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.POST("/agent/chatops/leaderboard", middleware.AgentChatOpsRateLimit(), controller.LeaderboardAgentChatOps)
 		apiRouter.POST("/agent/chatops/invite", middleware.AgentChatOpsRateLimit(), controller.HandleAgentChatOpsInvite)
 		apiRouter.GET("/agent/chatops/config/export", middleware.AgentChatOpsRateLimit(), controller.ExportAgentGameConfig)
+		apiRouter.GET("/agent/chatops/image-config", middleware.AgentChatOpsRateLimit(), controller.GetAgentImageConfig)
 		apiRouter.POST("/agent/chatops/config/import", middleware.AgentChatOpsRateLimit(), controller.ImportAgentGameConfig)
 		apiRouter.GET("/agent/chatops/bindings/export", middleware.AgentChatOpsRateLimit(), controller.ExportAgentChatBindings)
 		apiRouter.POST("/agent/chatops/history/get", middleware.AgentChatOpsRateLimit(), controller.GetAgentChatHistory)

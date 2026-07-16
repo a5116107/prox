@@ -50,11 +50,17 @@ sudo systemctl daemon-reload
 ```
 
 Set `HERMES_ADAPTER_KEY`/`GAME_ADMIN_KEY` to the same value as
-`HERMES_SHARED_KEY` in `.env.deploy`. Set `IMAGE_API_BASE_URL`,
-`IMAGE_API_KEY`, and `IMAGE_MODEL` in `/etc/prox/hermes.env` before starting
-the Adapter. The production image key must live only in that mode-`0600`
-environment file. Validate the configured provider without printing the key,
-then start the unit:
+`HERMES_SHARED_KEY` in `.env.deploy`. Set `CHATOPS_WEBHOOK_SECRET` to the same
+secret saved under **Operations > Agent Ops**. Keep
+`IMAGE_CONFIG_FROM_NEWAPI=true`, `IMAGE_CONFIG_CACHE_TTL_SECONDS=15`, and
+`IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS=2`.
+`IMAGE_API_BASE_URL`, `IMAGE_API_KEY`, and the other `IMAGE_*` values are the
+startup and New API outage fallback. A non-empty image key saved in Agent Ops
+takes precedence and is never returned by the normal admin option API.
+
+The fallback image key must live only in the mode-`0600` environment file.
+Validate a configured fallback provider without printing the key, then start
+the unit:
 
 ```bash
 sudo bash -c 'set -a; source /etc/prox/hermes.env; set +a; \
@@ -62,6 +68,22 @@ sudo bash -c 'set -a; source /etc/prox/hermes.env; set +a; \
   "$IMAGE_API_BASE_URL/models" | grep -q "gpt-image-2"'
 sudo systemctl enable --now prox-hermes-adapter
 sudo bash scripts/deploy/check-adapter-health.sh
+```
+
+Image settings saved in Agent Ops are read through the internal no-store
+endpoint and become effective after at most `IMAGE_CONFIG_CACHE_TTL_SECONDS`;
+the Adapter does not need a restart. Verify the endpoint and Adapter-selected
+source without printing the image key:
+
+```bash
+set -a; source /etc/prox/hermes.env; set +a
+curl -fsS -H "Authorization: Bearer $CHATOPS_WEBHOOK_SECRET" \
+  'http://127.0.0.1:3000/api/agent/chatops/image-config?source=qq' \
+  | jq -e '.success == true and (.data.api_key_configured | type == "boolean")' >/dev/null
+sleep "${IMAGE_CONFIG_CACHE_TTL_SECONDS:-15}"
+adapter_health_url="${HERMES_ADAPTER_HEALTH_URL:-http://${HERMES_ADAPTER_HOST}:${HERMES_ADAPTER_PORT:-18181}/health}"
+curl -fsS "$adapter_health_url" \
+  | jq -e '.ok == true and .image.source == "newapi"' >/dev/null
 ```
 
 Release the application image:
@@ -85,6 +107,11 @@ curl -fsS http://127.0.0.1:3000/api/status
 curl -fsS http://127.0.0.1:3000/release-marker.txt
 sudo bash scripts/deploy/check-adapter-health.sh
 systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
+sudo bash -c '
+  set -a; source /etc/prox/hermes.env; set +a
+  health_url="${HERMES_ADAPTER_HEALTH_URL:-http://${HERMES_ADAPTER_HOST}:${HERMES_ADAPTER_PORT:-18181}/health}"
+  curl -fsS "$health_url" | jq -e '\''.image.source == "newapi"'\'' >/dev/null
+'
 ```
 
 The checkout must list only GitHub as `origin`. The image tag, image ID, commit,

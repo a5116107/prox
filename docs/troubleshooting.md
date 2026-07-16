@@ -42,16 +42,26 @@ Verify `HERMES_SHARED_KEY` matches `HERMES_ADAPTER_KEY`/`GAME_ADMIN_KEY`, the On
 ```bash
 systemctl show prox-hermes-adapter -p MainPID -p EnvironmentFiles --no-pager
 journalctl -u prox-hermes-adapter --since '2 hours ago' --no-pager \
-  | grep -E '\[Image\]|image_generate|Photo send'
-grep -E '^(IMAGE_API_BASE_URL|IMAGE_MODEL|IMAGE_SIZE|IMAGE_RETRY_LIMIT)=' \
+  | grep -E 'image_config_refresh|image_upstream|image_delivery'
+grep -E '^(IMAGE_CONFIG_FROM_NEWAPI|IMAGE_CONFIG_CACHE_TTL_SECONDS|IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS|IMAGE_API_BASE_URL|IMAGE_MODEL|IMAGE_SIZE|IMAGE_RETRY_LIMIT)=' \
   /etc/prox/hermes.env
+sudo bash -c '
+  set -a; source /etc/prox/hermes.env; set +a
+  health_url="${HERMES_ADAPTER_HEALTH_URL:-http://${HERMES_ADAPTER_HOST}:${HERMES_ADAPTER_PORT:-18181}/health}"
+  curl -fsS "$health_url"
+' | jq '.image'
 ```
 
-An HTTP `401/403` means the image credential must be rotated. HTTP `502/524`
-is transient and is retried within `IMAGE_RETRY_LIMIT`; persistent failures
-must remain visible as `image_generate status=error`. A successful generation
-with `status=delivery_error` points to OneBot image delivery, and the Adapter
-sends the generated URL as a fallback so the result is not lost.
+`image_config_refresh status=ok source=newapi` proves the Adapter loaded the
+admin configuration. `status=fallback` means New API or its ChatOps secret is
+unavailable; the Adapter keeps the cached or environment configuration and
+retries within five seconds. After an admin save, allow one configured cache
+TTL before treating an old value as stale.
+
+An `image_upstream` HTTP `401/403` means the selected image credential must be
+rotated. HTTP `502/524` is transient and is retried within the selected retry
+limit. `image_delivery status=delivery_error` points to OneBot delivery; the
+Adapter sends the generated URL as a fallback so the result is not lost.
 
 ## Quiz has no question
 

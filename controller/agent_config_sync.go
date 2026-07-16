@@ -27,6 +27,18 @@ func ExportAgentGameConfig(c *gin.Context) {
 	})
 }
 
+func GetAgentImageConfig(c *gin.Context) {
+	// This endpoint returns the image provider credential. Only the dedicated
+	// ChatOps bearer secret is accepted; connector tokens and query parameters
+	// have intentionally narrower privileges.
+	if !service.AgentChatOpsSecretOK("internal", c.GetHeader("Authorization"), "", "") {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "invalid chatops secret"})
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	common.ApiSuccess(c, service.GetAgentImageRuntimeConfig())
+}
+
 func ImportAgentGameConfig(c *gin.Context) {
 	if !service.AgentChatOpsSecretOK(c.DefaultQuery("source", "admin"), c.GetHeader("Authorization"), c.Query("secret"), c.GetHeader("X-Telegram-Bot-Api-Secret-Token")) {
 		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "invalid chatops secret"})

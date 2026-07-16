@@ -124,6 +124,25 @@ IMAGE_REQUIRE_BIND = os.environ.get("IMAGE_REQUIRE_BIND", "0").strip().lower() i
     "yes",
     "on",
 )
+IMAGE_CONFIG_FROM_NEWAPI = os.environ.get(
+    "IMAGE_CONFIG_FROM_NEWAPI", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+try:
+    IMAGE_CONFIG_CACHE_TTL_SECONDS = int(
+        os.environ.get("IMAGE_CONFIG_CACHE_TTL_SECONDS", "15")
+    )
+except (TypeError, ValueError):
+    IMAGE_CONFIG_CACHE_TTL_SECONDS = 15
+IMAGE_CONFIG_CACHE_TTL_SECONDS = min(300, max(1, IMAGE_CONFIG_CACHE_TTL_SECONDS))
+try:
+    IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS = float(
+        os.environ.get("IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS", "2")
+    )
+except (TypeError, ValueError):
+    IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS = 2.0
+IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS = min(
+    5.0, max(0.25, IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS)
+)
 OPEN_SOURCE_LOOKUP_ENABLED = os.environ.get(
     "HERMES_OPEN_SOURCE_LOOKUP_ENABLED", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
@@ -2829,14 +2848,21 @@ _IMAGE_STATUS_PATTERNS = [
 ]
 _IMAGE_COOLDOWN = {}
 _IMAGE_PENDING = {}
+_IMAGE_CONFIG_CACHE = {"value": None, "expires_at": 0.0}
+_IMAGE_CONFIG_LOCK = threading.Lock()
 
 
 def _image_cooldown_key(platform, room_id, user_id):
     return f"{platform}:{room_id}:{user_id}"
 
 
-def _image_cooldown_left(platform, room_id, user_id):
-    if IMAGE_COOLDOWN_SECONDS <= 0:
+def _image_cooldown_left(platform, room_id, user_id, cooldown_seconds=None):
+    cooldown_seconds = (
+        IMAGE_COOLDOWN_SECONDS
+        if cooldown_seconds is None
+        else max(0, int(cooldown_seconds))
+    )
+    if cooldown_seconds <= 0:
         return 0
     now = time.time()
     key = _image_cooldown_key(platform, room_id, user_id)
@@ -2847,11 +2873,16 @@ def _image_cooldown_left(platform, room_id, user_id):
     return int(until - now + 0.999)
 
 
-def _set_image_cooldown(platform, room_id, user_id):
-    if IMAGE_COOLDOWN_SECONDS <= 0:
+def _set_image_cooldown(platform, room_id, user_id, cooldown_seconds=None):
+    cooldown_seconds = (
+        IMAGE_COOLDOWN_SECONDS
+        if cooldown_seconds is None
+        else max(0, int(cooldown_seconds))
+    )
+    if cooldown_seconds <= 0:
         return
     _IMAGE_COOLDOWN[_image_cooldown_key(platform, room_id, user_id)] = (
-        time.time() + IMAGE_COOLDOWN_SECONDS
+        time.time() + cooldown_seconds
     )
 
 
@@ -4305,19 +4336,195 @@ def send_qq_photo(msg_type, target_id, photo_url, caption=""):
         with urllib.request.urlopen(req, timeout=20) as r:
             resp = json.loads(r.read(65536).decode("utf-8") or "{}")
         mid = (resp.get("data") or {}).get("message_id")
+        photo_kind = (
+            "url"
+            if photo_url.lower().startswith(("http://", "https://"))
+            else "inline"
+            if photo_url.lower().startswith("data:")
+            else "other"
+        )
         print(
-            f"[OneBot] Photo sent to {msg_type}/{target_id}: {photo_url[:120]}",
+            f"[OneBot] Photo sent to {msg_type}/{target_id}: kind={photo_kind}",
             flush=True,
         )
         return mid
     except Exception as e:
-        print(f"[OneBot] Photo send error: {e}", flush=True)
+        print(f"[OneBot] Photo send error: {_redact_image_error_text(e)}", flush=True)
         return None
 
 
-def _image_headers():
+def _image_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return bool(default)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _image_number(value, default, minimum, maximum, integer=False):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    parsed = min(float(maximum), max(float(minimum), parsed))
+    return int(parsed) if integer else parsed
+
+
+def _image_env_config():
     return {
-        "Authorization": "Bearer " + IMAGE_API_KEY,
+        "enabled": True,
+        "api_base_url": str(IMAGE_API_BASE_URL or "").rstrip("/"),
+        "api_key": str(IMAGE_API_KEY or "").strip(),
+        "model": str(IMAGE_MODEL or "gpt-image-2").strip() or "gpt-image-2",
+        "size": str(IMAGE_SIZE or "1024x1024").strip() or "1024x1024",
+        "timeout_seconds": _image_number(IMAGE_TIMEOUT, 180, 1, 600),
+        "retry_limit": _image_number(IMAGE_RETRY_LIMIT, 2, 1, 5, integer=True),
+        "retry_base_delay_seconds": _image_number(
+            IMAGE_RETRY_BASE_DELAY, 3, 0, 300
+        ),
+        "retry_max_delay_seconds": _image_number(
+            IMAGE_RETRY_MAX_DELAY, 15, 0, 300
+        ),
+        "cooldown_seconds": _image_number(
+            IMAGE_COOLDOWN_SECONDS, 45, 0, 86400, integer=True
+        ),
+        "require_bind": bool(IMAGE_REQUIRE_BIND),
+        "source": "environment",
+    }
+
+
+def _normalize_image_runtime_config(payload, fallback):
+    raw = dict(payload or {}) if isinstance(payload, dict) else {}
+    result = dict(fallback)
+    result["enabled"] = _image_bool(raw.get("enabled"), fallback.get("enabled", True))
+    base_url = str(raw.get("api_base_url") or "").strip().rstrip("/")
+    if base_url.lower().startswith(("http://", "https://")):
+        result["api_base_url"] = base_url
+    api_key = str(raw.get("api_key") or "").strip()
+    if api_key:
+        result["api_key"] = api_key
+    result["model"] = (
+        str(raw.get("model") or fallback.get("model") or "gpt-image-2").strip()
+        or "gpt-image-2"
+    )
+    result["size"] = (
+        str(raw.get("size") or fallback.get("size") or "1024x1024").strip()
+        or "1024x1024"
+    )
+    result["timeout_seconds"] = _image_number(
+        raw.get("timeout_seconds"), fallback.get("timeout_seconds", 180), 1, 600
+    )
+    result["retry_limit"] = _image_number(
+        raw.get("retry_limit"), fallback.get("retry_limit", 2), 1, 5, integer=True
+    )
+    result["retry_base_delay_seconds"] = _image_number(
+        raw.get("retry_base_delay_seconds"),
+        fallback.get("retry_base_delay_seconds", 3),
+        0,
+        300,
+    )
+    result["retry_max_delay_seconds"] = max(
+        result["retry_base_delay_seconds"],
+        _image_number(
+            raw.get("retry_max_delay_seconds"),
+            fallback.get("retry_max_delay_seconds", 15),
+            0,
+            300,
+        ),
+    )
+    result["cooldown_seconds"] = _image_number(
+        raw.get("cooldown_seconds"),
+        fallback.get("cooldown_seconds", 45),
+        0,
+        86400,
+        integer=True,
+    )
+    result["require_bind"] = _image_bool(
+        raw.get("require_bind"), fallback.get("require_bind", False)
+    )
+    result["source"] = "newapi"
+    return result
+
+
+def _get_image_runtime_config(force=False):
+    now = time.time()
+    cached = _IMAGE_CONFIG_CACHE.get("value")
+    if not force and cached and now < float(_IMAGE_CONFIG_CACHE.get("expires_at") or 0):
+        return dict(cached)
+
+    fallback = dict(cached or _image_env_config())
+    if not IMAGE_CONFIG_FROM_NEWAPI:
+        return fallback
+    base = (
+        os.environ.get("NEWAPI_INTERNAL_BASE_URL")
+        or os.environ.get("NEWAPI_CHATOPS_BASE_URL")
+        or "http://127.0.0.1:3000"
+    ).rstrip("/")
+    secret = _chatops_secret()
+    if not base or not secret:
+        return fallback
+
+    with _IMAGE_CONFIG_LOCK:
+        now = time.time()
+        cached = _IMAGE_CONFIG_CACHE.get("value")
+        if (
+            not force
+            and cached
+            and now < float(_IMAGE_CONFIG_CACHE.get("expires_at") or 0)
+        ):
+            return dict(cached)
+        fallback = dict(cached or _image_env_config())
+        try:
+            req = urllib.request.Request(
+                _chatops_url(
+                    base, "/api/agent/chatops/image-config", secret, "qq"
+                ),
+                headers=_chatops_headers(secret, "qq"),
+            )
+            with urllib.request.urlopen(
+                req, timeout=IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS
+            ) as resp:
+                body = json.loads(resp.read(65536).decode("utf-8") or "{}")
+            payload = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(payload, dict) or body.get("success") is not True:
+                raise RuntimeError("invalid image config response")
+            # A successful response is always overlaid on the immutable
+            # environment fallback. This lets an admin clear a database key
+            # without the previous database value surviving in the cache.
+            config = _normalize_image_runtime_config(payload, _image_env_config())
+            _IMAGE_CONFIG_CACHE["value"] = config
+            _IMAGE_CONFIG_CACHE["expires_at"] = now + IMAGE_CONFIG_CACHE_TTL_SECONDS
+            log(
+                {
+                    "event": "image_config_refresh",
+                    "status": "ok",
+                    "source": "newapi",
+                    "enabled": config.get("enabled"),
+                    "key_configured": bool(config.get("api_key")),
+                    "model": config.get("model"),
+                    "size": config.get("size"),
+                }
+            )
+            return dict(config)
+        except Exception as error:
+            _IMAGE_CONFIG_CACHE["value"] = fallback
+            _IMAGE_CONFIG_CACHE["expires_at"] = now + min(
+                5, IMAGE_CONFIG_CACHE_TTL_SECONDS
+            )
+            log(
+                {
+                    "event": "image_config_refresh",
+                    "status": "fallback",
+                    "source": fallback.get("source", "environment"),
+                    "detail": _redact_image_error_text(error)[:200],
+                }
+            )
+            return fallback
+
+
+def _image_headers(api_key):
+    return {
+        "Authorization": "Bearer " + str(api_key or ""),
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -4371,8 +4578,10 @@ def _image_http_error_detail(error):
     return _redact_image_error_text(raw)[:300]
 
 
-def _image_retry_delay(attempt, error=None):
-    delay = IMAGE_RETRY_BASE_DELAY * (2 ** max(0, int(attempt) - 1))
+def _image_retry_delay(attempt, config, error=None):
+    delay = float(config.get("retry_base_delay_seconds") or 0) * (
+        2 ** max(0, int(attempt) - 1)
+    )
     headers = getattr(error, "headers", None)
     retry_after = headers.get("Retry-After") if headers else None
     if retry_after not in (None, ""):
@@ -4380,29 +4589,39 @@ def _image_retry_delay(attempt, error=None):
             delay = max(delay, float(retry_after))
         except (TypeError, ValueError):
             pass
-    return min(IMAGE_RETRY_MAX_DELAY, max(0.0, delay))
+    return min(
+        float(config.get("retry_max_delay_seconds") or 0), max(0.0, delay)
+    )
 
 
-def _call_image_service(prompt):
-    if not IMAGE_API_KEY or not IMAGE_API_BASE_URL:
+def _call_image_service(prompt, runtime_config=None):
+    config = dict(runtime_config or _get_image_runtime_config())
+    if not config.get("enabled"):
+        return {"ok": False, "error": "image_service_disabled"}
+    api_key = str(config.get("api_key") or "").strip()
+    api_base_url = str(config.get("api_base_url") or "").strip().rstrip("/")
+    if not api_key or not api_base_url:
         return {"ok": False, "error": "image_service_not_configured"}
     payload = {
-        "model": IMAGE_MODEL,
+        "model": config.get("model") or "gpt-image-2",
         "prompt": prompt,
-        "size": IMAGE_SIZE,
+        "size": config.get("size") or "1024x1024",
         "n": 1,
         "response_format": "url",
     }
     last_error = "unknown"
-    for attempt in range(1, IMAGE_RETRY_LIMIT + 1):
+    retry_limit = int(config.get("retry_limit") or 1)
+    for attempt in range(1, retry_limit + 1):
         retry_error = None
         try:
             req = urllib.request.Request(
-                IMAGE_API_BASE_URL + "/images/generations",
+                api_base_url + "/images/generations",
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers=_image_headers(),
+                headers=_image_headers(api_key),
             )
-            with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
+            with urllib.request.urlopen(
+                req, timeout=float(config.get("timeout_seconds") or 180)
+            ) as resp:
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             items = data.get("data") or []
             first = items[0] if items else {}
@@ -4426,7 +4645,7 @@ def _call_image_service(prompt):
             last_error = f"http_{e.code}:{detail or e.reason}"
             retryable = e.code in _IMAGE_RETRYABLE_HTTP_STATUSES
             print(
-                f"[Image] HTTPError attempt={attempt}/{IMAGE_RETRY_LIMIT} status={e.code} retryable={retryable} detail={detail}",
+                f"[Image] HTTPError attempt={attempt}/{retry_limit} status={e.code} retryable={retryable} detail={detail}",
                 flush=True,
             )
             if not retryable:
@@ -4435,10 +4654,11 @@ def _call_image_service(prompt):
         except Exception as e:
             last_error = _redact_image_error_text(e)[:300]
             print(
-                f"[Image] error attempt={attempt}/{IMAGE_RETRY_LIMIT}: {e}", flush=True
+                f"[Image] error attempt={attempt}/{retry_limit}: {last_error}",
+                flush=True,
             )
-        if attempt < IMAGE_RETRY_LIMIT:
-            delay = _image_retry_delay(attempt, retry_error)
+        if attempt < retry_limit:
+            delay = _image_retry_delay(attempt, config, retry_error)
             if delay > 0:
                 time.sleep(delay)
     return {"ok": False, "error": last_error[:300]}
@@ -4452,7 +4672,7 @@ def _human_image_error_message(username, error, msg_type="group"):
             prefix
             + "这次图没出成功，我已经记下失败了。你等会儿再发一次，我继续给你画。"
         )
-    if "image_service_not_configured" in detail:
+    if "image_service_not_configured" in detail or "image_service_disabled" in detail:
         return (
             prefix
             + "这条生图线路现在还没配置好，我已经把错误记下来了。管理员补上图片接口地址和 key 后，我就能正常继续画。"
@@ -4497,15 +4717,32 @@ def _image_delivery_fallback_message(username, photo_url, msg_type="group"):
     return prefix + "图片已经生成，但 QQ 图片消息发送失败。稍后再发一次，我继续处理。"
 
 
-def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt):
+def _start_qq_image_job(
+    msg_type, target_id, room_id, user_id, username, prompt, runtime_config=None
+):
     def worker():
         started = time.time()
+        config = dict(runtime_config or _get_image_runtime_config())
         try:
-            result = _call_image_service(prompt)
+            result = _call_image_service(prompt, runtime_config=config)
             latency = int((time.time() - started) * 1000)
+            log(
+                {
+                    "event": "image_upstream",
+                    "source": "qq",
+                    "room_id": room_id,
+                    "user_id": user_id,
+                    "status": "ok" if result.get("ok") else "error",
+                    "latency_ms": latency,
+                    "model": config.get("model"),
+                    "size": config.get("size"),
+                    "detail": str(result.get("error") or "")[:200],
+                }
+            )
             if result.get("ok") and result.get("photo_url"):
                 photo_url = result.get("photo_url")
                 caption = f"{username}，图已经生成好了：{prompt[:80]}"
+                delivery_started = time.time()
                 reply_mid = send_qq_photo(msg_type, target_id, photo_url, caption)
                 if reply_mid is None:
                     fallback_mid = send_qq_reply(
@@ -4523,14 +4760,17 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
                         )
                     log(
                         {
-                            "event": "image_generate",
+                            "event": "image_delivery",
                             "source": "qq",
                             "room_id": room_id,
                             "user_id": user_id,
                             "status": "delivery_error",
-                            "latency_ms": latency,
-                            "prompt": prompt[:120],
-                            "photo": photo_url[:180],
+                            "latency_ms": int(
+                                (time.time() - delivery_started) * 1000
+                            ),
+                            "generated_url_available": str(photo_url).lower().startswith(
+                                ("http://", "https://")
+                            ),
                         }
                     )
                     return
@@ -4540,14 +4780,13 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
                     )
                 log(
                     {
-                        "event": "image_generate",
+                        "event": "image_delivery",
                         "source": "qq",
                         "room_id": room_id,
                         "user_id": user_id,
                         "status": "ok",
-                        "latency_ms": latency,
-                        "prompt": prompt[:120],
-                        "photo": photo_url[:180],
+                        "latency_ms": int((time.time() - delivery_started) * 1000),
+                        "message_id": str(reply_mid),
                     }
                 )
                 return
@@ -4560,18 +4799,6 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
                 _remember_recent_bot_group_reply(
                     "qq", room_id, user_id, reply_mid, reason="image_error"
                 )
-            log(
-                {
-                    "event": "image_generate",
-                    "source": "qq",
-                    "room_id": room_id,
-                    "user_id": user_id,
-                    "status": "error",
-                    "latency_ms": latency,
-                    "prompt": prompt[:120],
-                    "detail": str(result.get("error") or "")[:200],
-                }
-            )
         except Exception as e:
             latency = int((time.time() - started) * 1000)
             detail = _redact_image_error_text(e)[:200]
@@ -4583,13 +4810,12 @@ def _start_qq_image_job(msg_type, target_id, room_id, user_id, username, prompt)
             )
             log(
                 {
-                    "event": "image_generate",
+                    "event": "image_upstream",
                     "source": "qq",
                     "room_id": room_id,
                     "user_id": user_id,
                     "status": "worker_error",
                     "latency_ms": latency,
-                    "prompt": prompt[:120],
                     "detail": detail,
                 }
             )
@@ -5166,7 +5392,8 @@ def handle_onebot(req):
     ident = resolve_identity_via_newapi("qq", identity_room_id, uid, username)
     if image_prompt:
         room_id = gid if mt == "group" else uid
-        if IMAGE_REQUIRE_BIND and not bool(
+        image_config = _get_image_runtime_config()
+        if image_config.get("require_bind") and not bool(
             ident.get("user_bound") or ident.get("bound")
         ):
             reply = _render_bind_required_reply(
@@ -5186,12 +5413,21 @@ def handle_onebot(req):
                 200,
                 {"ok": True, "image_handled": False, "reason": "bind_required"},
             )
-        if not IMAGE_API_KEY or not IMAGE_API_BASE_URL:
+        if (
+            not image_config.get("enabled")
+            or not image_config.get("api_key")
+            or not image_config.get("api_base_url")
+        ):
+            reason = (
+                "image_service_disabled"
+                if not image_config.get("enabled")
+                else "image_service_not_configured"
+            )
             reply_mid = send_qq_reply(
                 mt,
                 gid if mt == "group" else uid,
                 _human_image_error_message(
-                    username, "image_service_not_configured", mt
+                    username, reason, mt
                 ),
             )
             if mt == "group" and reply_mid:
@@ -5208,10 +5444,12 @@ def handle_onebot(req):
                 {
                     "ok": True,
                     "image_handled": False,
-                    "reason": "image_service_not_configured",
+                    "reason": reason,
                 },
             )
-        cooldown_left = _image_cooldown_left("qq", room_id, uid)
+        cooldown_left = _image_cooldown_left(
+            "qq", room_id, uid, image_config.get("cooldown_seconds")
+        )
         if cooldown_left > 0:
             reply = (
                 f"@{username} 你画得太快啦，等 {cooldown_left} 秒后再发一次。"
@@ -5233,7 +5471,9 @@ def handle_onebot(req):
                     "cooldown_left": cooldown_left,
                 },
             )
-        _set_image_cooldown("qq", room_id, uid)
+        _set_image_cooldown(
+            "qq", room_id, uid, image_config.get("cooldown_seconds")
+        )
         _set_image_pending("qq", room_id, uid, image_prompt)
         ack = (
             f"@{username} 收到，这就开始画：{image_prompt[:60]}"
@@ -5246,7 +5486,13 @@ def handle_onebot(req):
                 "qq", conversation_room_id, uid, reply_mid, reason="image_ack"
             )
         _start_qq_image_job(
-            mt, gid if mt == "group" else uid, room_id, uid, username, image_prompt
+            mt,
+            gid if mt == "group" else uid,
+            room_id,
+            uid,
+            username,
+            image_prompt,
+            runtime_config=image_config,
         )
         return send_json(
             req, 200, {"ok": True, "image_handled": True, "prompt": image_prompt[:120]}
@@ -5983,6 +6229,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/health":
+            image_config = _get_image_runtime_config()
             return send_json(
                 self,
                 200,
@@ -5993,6 +6240,14 @@ class Handler(BaseHTTPRequestHandler):
                     "base_url_set": bool(API_BASE_URL),
                     "key_set": bool(API_KEY),
                     "onebot_url": ONEBOT_URL,
+                    "image": {
+                        "enabled": bool(image_config.get("enabled")),
+                        "base_url_set": bool(image_config.get("api_base_url")),
+                        "key_set": bool(image_config.get("api_key")),
+                        "model": image_config.get("model"),
+                        "size": image_config.get("size"),
+                        "source": image_config.get("source"),
+                    },
                 },
             )
         if path == "/game-admin" or path == "/game-admin/":

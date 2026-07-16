@@ -217,7 +217,30 @@ type AgentDashboard = {
   tools?: AgentTool[]
 }
 
-const schema = z.object({
+const imageApiBaseUrlSchema = z.string().refine((value) => {
+  if (!value) return true
+  try {
+    const parsed = new URL(value)
+    return (
+      ['http:', 'https:'].includes(parsed.protocol) &&
+      !parsed.username &&
+      !parsed.password
+    )
+  } catch {
+    return false
+  }
+}, 'Enter an HTTP(S) URL without embedded credentials')
+
+const imageSizeSchema = z.string().refine((value) => {
+  if (value === 'auto') return true
+  const match = /^(\d+)x(\d+)$/.exec(value)
+  if (!match) return false
+  const width = Number(match[1])
+  const height = Number(match[2])
+  return width >= 256 && width <= 4096 && height >= 256 && height <= 4096
+}, 'Use auto or WIDTHxHEIGHT with dimensions from 256 to 4096')
+
+const agentSettingsSchema = z.object({
   enabled: z.boolean(),
   siteId: z.string().min(1),
   siteName: z.string().min(1),
@@ -230,6 +253,17 @@ const schema = z.object({
   plannerProvider: z.string().min(1),
   hermesBaseUrl: z.string().url().optional().or(z.literal('')),
   hermesApiKey: z.string().optional(),
+  imageGenerationEnabled: z.boolean(),
+  imageApiBaseUrl: imageApiBaseUrlSchema,
+  imageApiKey: z.string().optional(),
+  imageModel: z.string().min(1).max(128),
+  imageSize: imageSizeSchema,
+  imageTimeoutSeconds: z.coerce.number().min(1).max(600),
+  imageRetryLimit: z.coerce.number().int().min(1).max(5),
+  imageRetryBaseDelaySeconds: z.coerce.number().min(0).max(300),
+  imageRetryMaxDelaySeconds: z.coerce.number().min(0).max(300),
+  imageCooldownSeconds: z.coerce.number().int().min(0).max(86400),
+  imageRequireBind: z.boolean(),
   directorEnabled: z.boolean(),
   communityEnabled: z.boolean(),
   growthEnabled: z.boolean(),
@@ -277,6 +311,16 @@ const schema = z.object({
   welcomeTemplate: z.string(),
   activityPolicy: z.string(),
   riskPolicy: z.string(),
+})
+
+const schema = agentSettingsSchema.superRefine((values, context) => {
+  if (values.imageRetryMaxDelaySeconds < values.imageRetryBaseDelaySeconds) {
+    context.addIssue({
+      code: 'custom',
+      path: ['imageRetryMaxDelaySeconds'],
+      message: 'Maximum retry delay must be at least the initial delay',
+    })
+  }
 })
 
 type Values = z.infer<typeof schema>
@@ -375,6 +419,17 @@ const optionKeyMap: Record<keyof Values, string> = {
   plannerProvider: 'agent_setting.planner_provider',
   hermesBaseUrl: 'agent_setting.hermes_base_url',
   hermesApiKey: 'agent_setting.hermes_api_key',
+  imageGenerationEnabled: 'agent_setting.image_generation_enabled',
+  imageApiBaseUrl: 'agent_setting.image_api_base_url',
+  imageApiKey: 'agent_setting.image_api_key',
+  imageModel: 'agent_setting.image_model',
+  imageSize: 'agent_setting.image_size',
+  imageTimeoutSeconds: 'agent_setting.image_timeout_seconds',
+  imageRetryLimit: 'agent_setting.image_retry_limit',
+  imageRetryBaseDelaySeconds: 'agent_setting.image_retry_base_delay_seconds',
+  imageRetryMaxDelaySeconds: 'agent_setting.image_retry_max_delay_seconds',
+  imageCooldownSeconds: 'agent_setting.image_cooldown_seconds',
+  imageRequireBind: 'agent_setting.image_require_bind',
   directorEnabled: 'agent_setting.director_enabled',
   communityEnabled: 'agent_setting.community_enabled',
   growthEnabled: 'agent_setting.growth_enabled',
@@ -427,6 +482,7 @@ const optionKeyMap: Record<keyof Values, string> = {
 const sensitiveFields: Array<keyof Values> = [
   'llmApiKey',
   'hermesApiKey',
+  'imageApiKey',
   'qqAccessToken',
   'tgBotToken',
   'chatOpsWebhookSecret',
@@ -451,6 +507,43 @@ function buildDefaults(defaultValues: Props['defaultValues']): Values {
     ),
     hermesBaseUrl: String(defaultValues['agent_setting.hermes_base_url'] || ''),
     hermesApiKey: '',
+    imageGenerationEnabled:
+      readConfiguredRobotBool(
+        defaultValues['agent_setting.image_generation_enabled']
+      ) ?? true,
+    imageApiBaseUrl: String(
+      defaultValues['agent_setting.image_api_base_url'] ||
+        'https://api.acica.top/v1'
+    ),
+    imageApiKey: '',
+    imageModel: String(
+      defaultValues['agent_setting.image_model'] || 'gpt-image-2'
+    ),
+    imageSize: String(defaultValues['agent_setting.image_size'] || '1024x1024'),
+    imageTimeoutSeconds: readConfiguredRobotNumber(
+      defaultValues['agent_setting.image_timeout_seconds'],
+      180
+    ),
+    imageRetryLimit: readConfiguredRobotNumber(
+      defaultValues['agent_setting.image_retry_limit'],
+      2
+    ),
+    imageRetryBaseDelaySeconds: readConfiguredRobotNumber(
+      defaultValues['agent_setting.image_retry_base_delay_seconds'],
+      3
+    ),
+    imageRetryMaxDelaySeconds: readConfiguredRobotNumber(
+      defaultValues['agent_setting.image_retry_max_delay_seconds'],
+      15
+    ),
+    imageCooldownSeconds: readConfiguredRobotNumber(
+      defaultValues['agent_setting.image_cooldown_seconds'],
+      45
+    ),
+    imageRequireBind:
+      readConfiguredRobotBool(
+        defaultValues['agent_setting.image_require_bind']
+      ) ?? false,
     directorEnabled:
       readConfiguredRobotBool(
         defaultValues['agent_setting.director_enabled']
@@ -723,10 +816,10 @@ function readConfiguredRobotBool(value: unknown): boolean | null {
   return null
 }
 
-function readConfiguredRobotNumber(value: unknown) {
-  if (value === null || value === undefined || value === '') return 0
+function readConfiguredRobotNumber(value: unknown, fallback = 0) {
+  if (value === null || value === undefined || value === '') return fallback
   const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : 0
+  return Number.isFinite(parsed) ? parsed : fallback
 }
 
 function buildRobotConfiguredView(defaultValues: Props['defaultValues']) {
@@ -745,6 +838,16 @@ function buildRobotConfiguredView(defaultValues: Props['defaultValues']) {
       defaultValues,
       'agent_setting.planner_provider'
     ),
+    imageGenerationEnabled: readOpsSavedBool(
+      defaultValues,
+      'agent_setting.image_generation_enabled'
+    ),
+    imageApiBaseUrl: readOpsSavedText(
+      defaultValues,
+      'agent_setting.image_api_base_url'
+    ),
+    imageModel: readOpsSavedText(defaultValues, 'agent_setting.image_model'),
+    imageSize: readOpsSavedText(defaultValues, 'agent_setting.image_size'),
     qqBotEnabled: readOpsSavedBool(
       defaultValues,
       'agent_setting.qq_bot_enabled'
@@ -1502,6 +1605,7 @@ function AgentSettingsForm({
         <AgentCapabilityFields form={form} t={t} />
         <AgentBudgetRiskFields form={form} t={t} />
         <AgentConnectorFields form={form} t={t} />
+        <AgentImageGenerationFields form={form} t={t} />
         <AgentChatOpsFields form={form} t={t} />
         <AgentLegacySyncFields form={form} t={t} />
         <AgentPromptFields form={form} t={t} />
@@ -1522,6 +1626,10 @@ type AgentStringFieldName =
   | 'plannerProvider'
   | 'hermesBaseUrl'
   | 'hermesApiKey'
+  | 'imageApiBaseUrl'
+  | 'imageApiKey'
+  | 'imageModel'
+  | 'imageSize'
   | 'communityHost'
   | 'communityRoomId'
   | 'qqOneBotUrl'
@@ -1554,6 +1662,8 @@ type AgentBooleanFieldName =
   | 'budgetEnabled'
   | 'autoExecuteLowRisk'
   | 'humanApprovalEnabled'
+  | 'imageGenerationEnabled'
+  | 'imageRequireBind'
 
 function AgentSwitchField({
   form,
@@ -1861,6 +1971,128 @@ function AgentConnectorFields({ form, t }: AgentFormProps) {
         name='communityRoomId'
         label='Community room ID'
       />
+    </FieldGroup>
+  )
+}
+
+function AgentImageGenerationFields({ form, t }: AgentFormProps) {
+  const numericFields = [
+    {
+      name: 'imageTimeoutSeconds',
+      label: 'Image request timeout',
+      description: 'Maximum time to wait for one image generation request.',
+      min: 1,
+      max: 600,
+      step: 1,
+    },
+    {
+      name: 'imageRetryLimit',
+      label: 'Image retry attempts',
+      description: 'Total attempts for temporary upstream failures.',
+      min: 1,
+      max: 5,
+      step: 1,
+    },
+    {
+      name: 'imageRetryBaseDelaySeconds',
+      label: 'Initial retry delay',
+      description: 'Delay before the first retry; later retries use backoff.',
+      min: 0,
+      max: 300,
+      step: 0.5,
+    },
+    {
+      name: 'imageRetryMaxDelaySeconds',
+      label: 'Maximum retry delay',
+      description: 'Upper limit for retry backoff and Retry-After handling.',
+      min: 0,
+      max: 300,
+      step: 0.5,
+    },
+    {
+      name: 'imageCooldownSeconds',
+      label: 'Per-user image cooldown',
+      description: 'Minimum wait between image requests from the same user.',
+      min: 0,
+      max: 86400,
+      step: 1,
+    },
+  ] as const
+
+  return (
+    <FieldGroup
+      title={t('QQ image generation')}
+      description={t(
+        'Manage the image service, model, delivery timing, retries, and per-user limits without restarting the bot.'
+      )}
+    >
+      <AgentSwitchField
+        form={form}
+        t={t}
+        name='imageGenerationEnabled'
+        label='Enable QQ image generation'
+        description='Allow image commands in QQ groups and private chats.'
+      />
+      <AgentSwitchField
+        form={form}
+        t={t}
+        name='imageRequireBind'
+        label='Require account binding for images'
+        description='Only users linked to a site account can start image generation.'
+      />
+      <AgentInputField
+        form={form}
+        t={t}
+        name='imageApiBaseUrl'
+        label='Image service address'
+        description='OpenAI-compatible base URL ending at /v1.'
+      />
+      <AgentInputField
+        form={form}
+        t={t}
+        name='imageApiKey'
+        label='Image service key'
+        description='Leave blank to keep the current secret or environment fallback.'
+        secret
+      />
+      <AgentInputField
+        form={form}
+        t={t}
+        name='imageModel'
+        label='Image model'
+        placeholder='gpt-image-2'
+      />
+      <AgentInputField
+        form={form}
+        t={t}
+        name='imageSize'
+        label='Image size'
+        placeholder='1024x1024'
+        description='Use auto or WIDTHxHEIGHT supported by the selected service.'
+      />
+      {numericFields.map((item) => (
+        <FormField
+          key={item.name}
+          control={form.control}
+          name={item.name}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>{t(item.label)}</FormLabel>
+              <FormControl>
+                <Input
+                  type='number'
+                  min={item.min}
+                  max={item.max}
+                  step={item.step}
+                  {...field}
+                />
+              </FormControl>
+              <FormDescription>{t(item.description)}</FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+      ))}
     </FieldGroup>
   )
 }
@@ -2312,6 +2544,7 @@ export function AgentOpsSection({ defaultValues }: Props) {
       ...values,
       llmApiKey: '',
       hermesApiKey: '',
+      imageApiKey: '',
       qqAccessToken: '',
       tgBotToken: '',
       chatOpsWebhookSecret: '',
@@ -2518,6 +2751,24 @@ export function AgentOpsSection({ defaultValues }: Props) {
                     }`
                   : t('Not configured')
               }
+            />
+            <CardLine
+              label={t('QQ image generation')}
+              value={`${
+                savedView.imageGenerationEnabled === false
+                  ? t('Disabled')
+                  : t('Enabled')
+              } · ${savedView.imageModel || t('Not configured')} / ${
+                savedView.imageSize || t('Not configured')
+              }`}
+            />
+            <CardLine
+              label={t('Image service configuration')}
+              value={`${savedView.imageApiBaseUrl || t('Not configured')} · ${
+                rtBool('image_api_key_configured')
+                  ? t('Key saved in admin')
+                  : t('Using environment key or not configured')
+              }`}
             />
             <CardLine
               label={t('Configured QQ group IDs')}

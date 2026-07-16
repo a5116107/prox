@@ -52,6 +52,11 @@ _ISOLATED_ENV_KEYS = (
     "IMAGE_RETRY_LIMIT",
     "IMAGE_RETRY_BASE_DELAY",
     "IMAGE_RETRY_MAX_DELAY",
+    "IMAGE_COOLDOWN_SECONDS",
+    "IMAGE_REQUIRE_BIND",
+    "IMAGE_CONFIG_FROM_NEWAPI",
+    "IMAGE_CONFIG_CACHE_TTL_SECONDS",
+    "IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS",
 )
 
 
@@ -84,6 +89,7 @@ def adapter_loader(monkeypatch, tmp_path):
             "HERMES_BURN_QUEUE_CAPACITY": "8",
             "OPENAI_BASE_URL": "",
             "OPENAI_API_KEY": "",
+            "IMAGE_CONFIG_FROM_NEWAPI": "0",
         }
         defaults.update(env)
         for key, value in defaults.items():
@@ -894,6 +900,93 @@ def test_image_service_retries_transient_524_and_returns_generated_url(
     assert sent_payload["response_format"] == "url"
 
 
+def test_image_runtime_config_hot_loads_from_newapi_without_exposing_secret_in_url(
+    adapter_loader, monkeypatch
+):
+    adapter = adapter_loader(
+        IMAGE_CONFIG_FROM_NEWAPI="1",
+        IMAGE_CONFIG_CACHE_TTL_SECONDS="15",
+        IMAGE_API_KEY="environment-key",
+        NEWAPI_INTERNAL_BASE_URL="http://new-api:3000",
+        CHATOPS_WEBHOOK_SECRET="chatops-secret",
+    )
+    requests = []
+
+    def fake_urlopen(request, timeout=0):
+        requests.append((request, timeout))
+        return _FakeHTTPResponse(
+            {
+                "success": True,
+                "data": {
+                    "enabled": True,
+                    "api_base_url": "https://images.example.test/v1/",
+                    "api_key": "database-key",
+                    "model": "gpt-image-2",
+                    "size": "1536x1024",
+                    "timeout_seconds": 90,
+                    "retry_limit": 3,
+                    "retry_base_delay_seconds": 1.5,
+                    "retry_max_delay_seconds": 9,
+                    "cooldown_seconds": 30,
+                    "require_bind": True,
+                },
+            }
+        )
+
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+    config = adapter._get_image_runtime_config(force=True)
+
+    assert config["source"] == "newapi"
+    assert config["api_base_url"] == "https://images.example.test/v1"
+    assert config["api_key"] == "database-key"
+    assert config["size"] == "1536x1024"
+    assert config["retry_limit"] == 3
+    assert config["require_bind"] is True
+    assert len(requests) == 1
+    request = requests[0][0]
+    assert request.full_url.endswith("/api/agent/chatops/image-config?source=qq")
+    assert "chatops-secret" not in request.full_url
+    assert request.get_header("Authorization") == "Bearer chatops-secret"
+    assert requests[0][1] == 2.0
+
+
+def test_image_runtime_config_clear_restores_environment_key(
+    adapter_loader, monkeypatch
+):
+    adapter = adapter_loader(
+        IMAGE_CONFIG_FROM_NEWAPI="1",
+        IMAGE_API_KEY="environment-key",
+        NEWAPI_INTERNAL_BASE_URL="http://new-api:3000",
+        CHATOPS_WEBHOOK_SECRET="chatops-secret",
+    )
+    responses = iter(
+        [
+            {"success": True, "data": {"api_key": "database-key"}},
+            {"success": True, "data": {"api_key": ""}},
+        ]
+    )
+
+    monkeypatch.setattr(
+        adapter.urllib.request,
+        "urlopen",
+        lambda _request, timeout=0: _FakeHTTPResponse(next(responses)),
+    )
+
+    assert adapter._get_image_runtime_config(force=True)["api_key"] == "database-key"
+    restored = adapter._get_image_runtime_config(force=True)
+    assert restored["api_key"] == "environment-key"
+    assert restored["source"] == "newapi"
+
+
+def test_invalid_image_config_cache_ttl_uses_bounded_default(adapter_loader):
+    adapter = adapter_loader(
+        IMAGE_CONFIG_CACHE_TTL_SECONDS="invalid",
+        IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS="invalid",
+    )
+    assert adapter.IMAGE_CONFIG_CACHE_TTL_SECONDS == 15
+    assert adapter.IMAGE_CONFIG_FETCH_TIMEOUT_SECONDS == 2.0
+
+
 def test_image_service_does_not_retry_auth_failure_and_redacts_upstream_identity(
     adapter_loader, monkeypatch
 ):
@@ -948,7 +1041,7 @@ def test_image_job_reports_delivery_failure_and_keeps_generated_link(
     monkeypatch.setattr(
         adapter,
         "_call_image_service",
-        lambda prompt: {
+        lambda prompt, **_kwargs: {
             "ok": True,
             "photo_url": "https://cdn.example.test/generated.png",
             "revised_prompt": "",
@@ -979,8 +1072,11 @@ def test_image_job_reports_delivery_failure_and_keeps_generated_link(
 
     assert len(replies) == 1
     assert "https://cdn.example.test/generated.png" in replies[0][2]
-    image_logs = [event for event in logs if event.get("event") == "image_generate"]
-    assert image_logs[-1]["status"] == "delivery_error"
+    upstream_logs = [event for event in logs if event.get("event") == "image_upstream"]
+    delivery_logs = [event for event in logs if event.get("event") == "image_delivery"]
+    assert upstream_logs[-1]["status"] == "ok"
+    assert delivery_logs[-1]["status"] == "delivery_error"
+    assert delivery_logs[-1]["generated_url_available"] is True
     assert adapter._get_image_pending("qq", "925249987", "1001") is None
 
 
@@ -1003,7 +1099,7 @@ def test_image_worker_error_is_reported_redacted_and_clears_pending(
     logs = []
     adapter._set_image_pending("qq", "room-1", "user-1", "draw a dashboard")
 
-    def fail_image_service(prompt):
+    def fail_image_service(prompt, **_kwargs):
         raise RuntimeError("worker failed for user@example.com")
 
     monkeypatch.setattr(adapter, "_call_image_service", fail_image_service)

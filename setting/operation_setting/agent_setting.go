@@ -20,6 +20,18 @@ type AgentSetting struct {
 	HermesBaseURL   string `json:"hermes_base_url"`
 	HermesAPIKey    string `json:"hermes_api_key"`
 
+	ImageGenerationEnabled     bool    `json:"image_generation_enabled"`
+	ImageAPIBaseURL            string  `json:"image_api_base_url"`
+	ImageAPIKey                string  `json:"image_api_key"`
+	ImageModel                 string  `json:"image_model"`
+	ImageSize                  string  `json:"image_size"`
+	ImageTimeoutSeconds        int     `json:"image_timeout_seconds"`
+	ImageRetryLimit            int     `json:"image_retry_limit"`
+	ImageRetryBaseDelaySeconds float64 `json:"image_retry_base_delay_seconds"`
+	ImageRetryMaxDelaySeconds  float64 `json:"image_retry_max_delay_seconds"`
+	ImageCooldownSeconds       int     `json:"image_cooldown_seconds"`
+	ImageRequireBind           bool    `json:"image_require_bind"`
+
 	DirectorEnabled      bool `json:"director_enabled"`
 	CommunityEnabled     bool `json:"community_enabled"`
 	GrowthEnabled        bool `json:"growth_enabled"`
@@ -104,6 +116,17 @@ var agentSetting = AgentSetting{
 	PlannerProvider:               "builtin",
 	HermesBaseURL:                 "",
 	HermesAPIKey:                  "",
+	ImageGenerationEnabled:        true,
+	ImageAPIBaseURL:               "https://api.acica.top/v1",
+	ImageAPIKey:                   "",
+	ImageModel:                    "gpt-image-2",
+	ImageSize:                     "1024x1024",
+	ImageTimeoutSeconds:           180,
+	ImageRetryLimit:               2,
+	ImageRetryBaseDelaySeconds:    3,
+	ImageRetryMaxDelaySeconds:     15,
+	ImageCooldownSeconds:          45,
+	ImageRequireBind:              false,
 	DirectorEnabled:               true,
 	CommunityEnabled:              true,
 	GrowthEnabled:                 true,
