@@ -18,7 +18,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: bash scripts/test/prepare-embed-assets.sh
+      - run: node scripts/test/prepare-embed-assets.mjs
       - run: go test ./... -count=1 -timeout=15m
 
   quiz-postgres:
@@ -46,6 +46,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test ./service -run '^TestQuizDrawConcurrentPostgres$' -count=1 -timeout=3m
+      - run: go test ./model -run '^TestUserQuotaReservationConcurrentPostgres$' -count=1 -timeout=3m
 
   python:
     runs-on: ubuntu-latest

@@ -77,7 +77,7 @@ python integrations/newapi-hermes-adapter/adapter.py
 For a full Go test before building either frontend, create the ignored embed placeholders first:
 
 ```bash
-bash scripts/test/prepare-embed-assets.sh
+node scripts/test/prepare-embed-assets.mjs
 go test ./... -count=1
 ```
 
