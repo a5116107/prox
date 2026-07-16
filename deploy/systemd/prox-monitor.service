@@ -1,0 +1,16 @@
+[Unit]
+Description=prox production health probe
+After=docker.service network-online.target prox-hermes-adapter.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/prox/current
+EnvironmentFile=-/etc/prox/monitor.env
+ExecStart=/usr/bin/bash /opt/prox/current/scripts/deploy/monitor.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/tmp

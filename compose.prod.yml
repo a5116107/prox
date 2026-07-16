@@ -1,10 +1,17 @@
 name: prox-prod
 
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:15-alpine
     container_name: new-api-pg
     restart: always
+    logging: *json-logging
     environment:
       POSTGRES_USER: newapi
       POSTGRES_PASSWORD: "${PG_PASS:?set PG_PASS in .env.deploy}"
@@ -22,6 +29,7 @@ services:
     image: redis:7-alpine
     container_name: new-api-redis
     restart: always
+    logging: *json-logging
     command:
       - redis-server
       - --appendonly
@@ -36,6 +44,7 @@ services:
     image: "${NEWAPI_IMAGE:?set NEWAPI_IMAGE in .env.deploy}"
     container_name: new-api
     restart: always
+    logging: *json-logging
     ulimits:
       nofile:
         soft: 1048576
@@ -106,6 +115,7 @@ services:
     image: node:22-alpine
     container_name: new-api-oauth-worker
     restart: always
+    logging: *json-logging
     working_dir: /app
     command: ["node", "server.js"]
     environment:
@@ -126,6 +136,7 @@ services:
     image: nginx:1.27-alpine
     container_name: new-api-proxy
     restart: always
+    logging: *json-logging
     ulimits:
       nofile:
         soft: 1048576

@@ -18,8 +18,16 @@ bash scripts/deploy/release.sh
 4. Records the active image as `PREVIOUS_IMAGE`.
 5. Recreates only `new-api`; PostgreSQL, Redis, proxy, and OAuth Worker stay running.
 6. Waits for container health and `/api/status`.
-7. Verifies `/release-marker.txt` and that the quiz route is registered.
-8. Restores the previous image automatically if any post-switch check fails.
+7. Verifies `/release-marker.txt`, the favicon, a hashed frontend asset, the
+   quiz route, and protected/authorized image configuration route.
+8. Verifies the separate Adapter is healthy and has refreshed its image
+   configuration from New API.
+9. Restores the previous image automatically if any post-switch check fails.
+
+The GitHub `Container` workflow is reusable and is called by `Quality` only
+after all Go, PostgreSQL concurrency, Python, web, delivery, and secret jobs
+succeed for a `main` or `v*` push. Manual image builds remain available through
+`workflow_dispatch` for operator-controlled recovery.
 
 ## Manual rollback
 
@@ -36,6 +44,13 @@ bash scripts/deploy/rollback.sh prox-new-api:RELEASE_TAG
 ```
 
 The rollback also switches only `new-api` and repeats live route checks.
+
+After a release or rollback, run the same production probe used by systemd:
+
+```bash
+sudo bash scripts/deploy/monitor.sh | jq .
+docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
+```
 
 ## Compatibility rule
 
@@ -58,3 +73,17 @@ sudo bash scripts/deploy/check-adapter-health.sh
 ```
 
 Core API traffic remains available while Adapter restarts. Schedule Adapter restarts outside active game rounds.
+
+## Retention before large builds
+
+```bash
+df -h /
+docker system df -v
+docker buildx du
+sudo bash scripts/deploy/cleanup.sh --dry-run
+```
+
+Apply cleanup only outside an active release. The cleanup script takes the same
+release lock as deploy/rollback and never invokes a broad Docker prune. It may
+remove only dangling build cache older than `RELEASE_RETENTION_DAYS` when
+`BUILD_CACHE_PRUNE=1`.

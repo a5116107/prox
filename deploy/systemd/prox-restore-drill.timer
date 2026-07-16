@@ -1,0 +1,11 @@
+[Unit]
+Description=Run monthly prox backup restore drill
+
+[Timer]
+OnCalendar=Sun *-*-01..07 04:20:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=prox-restore-drill.service
+
+[Install]
+WantedBy=timers.target

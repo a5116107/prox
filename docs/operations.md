@@ -3,16 +3,23 @@
 ## Daily checks
 
 ```bash
-docker compose --env-file .env.deploy -f compose.prod.yml ps
-docker inspect new-api --format '{{.Config.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
-systemctl is-active prox-hermes-adapter
-curl -fsS http://127.0.0.1:3000/api/status
-sudo bash scripts/deploy/check-adapter-health.sh
+sudo bash scripts/deploy/monitor.sh | jq .
+systemctl --failed --no-pager
+systemctl list-timers 'prox-*' --no-pager
 df -h /
 docker system df
 ```
 
-Review Nginx status counts, API latency, upstream 429s, Bot action failures, budget pool balance, and risk-control audit events.
+`monitor.sh` fails if a required container is unhealthy, `/api/status` or the
+release marker is wrong, the favicon or a hashed frontend asset is unavailable,
+the internal image route loses protection, the Adapter does not use the New API
+configuration source, a container exceeds the configured restart threshold,
+the latest encrypted backup/restore proof is stale, or disk thresholds are exceeded. Set
+`MONITOR_ALERT_WEBHOOK` in mode-`0600` `/etc/prox/monitor.env` to receive the
+same machine-readable payload on failures.
+
+Review Nginx status counts, API latency, upstream 429s, Bot action failures,
+budget pool balance, and risk-control audit events in addition to this probe.
 
 ## Asynchronous task billing
 
@@ -68,10 +75,28 @@ built and `new-api` is recreated.
 
 ## Backups
 
-- PostgreSQL: daily custom-format dump, encrypted off-host copy, retention test.
-- `.env.deploy` and `/etc/prox/hermes.env`: encrypted secret store, not Git.
-- `/var/lib/prox-hermes`: daily file backup.
-- Restore rehearsal: at least monthly on an isolated database.
+The backup transaction contains a PostgreSQL custom dump, Adapter state,
+deployment configuration, secrets, release metadata, checksums, and a manifest.
+The plaintext staging directory is removed by an exit trap and only the
+authenticated age archive is retained.
+
+Create a backup and run an isolated restore proof manually:
+
+```bash
+sudo bash scripts/deploy/backup.sh
+sudo bash scripts/deploy/restore-drill.sh
+sudo journalctl -u prox-backup -u prox-restore-drill --since today --no-pager
+```
+
+Configure either `BACKUP_AGE_RECIPIENT` or
+`BACKUP_AGE_RECIPIENTS_FILE`. Keep `BACKUP_AGE_IDENTITY_FILE` in the operator
+secret store and on the restore-drill host with mode `0600`. Set
+`BACKUP_RCLONE_DEST` to copy each completed encrypted archive off-host;
+`BACKUP_RCLONE_PRUNE=1` applies the same retention only inside that dedicated
+destination. A restore drill decrypts into a private temporary directory,
+checks every artifact hash, rejects unexpected archive paths, starts an
+unpublished PostgreSQL 15 container with `--network none`, restores the dump,
+and compares the public table count from the manifest.
 
 ## Disk retention
 
@@ -84,7 +109,37 @@ docker buildx du
 du -xhd1 /opt/prox /var/lib/docker 2>/dev/null | sort -h
 ```
 
-Retain the active and previous `new-api` images. Remove only images not referenced by a container or `releases/current.env`. Rotate application/proxy logs through host policy; do not run broad prune commands during a release.
+Retain the active and previous `new-api` images. Remove only images not referenced by a container or `releases/current.env`. Compose bounds each container's JSON log to five 50 MiB files. `/etc/logrotate.d/prox` rotates host application and proxy logs daily with 14 compressed generations; validate it with `sudo logrotate --debug /etc/logrotate.d/prox`. Do not run broad prune commands during a release.
+
+Use the repository cleanup policy instead of a broad Docker prune:
+
+```bash
+sudo bash scripts/deploy/cleanup.sh --dry-run
+sudo bash scripts/deploy/cleanup.sh --apply
+```
+
+It considers only `IMAGE_REPOSITORY` release images and release metadata older
+than `RELEASE_RETENTION_DAYS`. Images referenced by any container, the active
+image, and the recorded rollback image are always retained. With
+`BUILD_CACHE_PRUNE=1`, it also asks Docker to remove dangling build cache older
+than the same retention period; it does not prune containers, volumes, or
+networks.
+
+## Operations timers
+
+Install and enable all production operations units:
+
+```bash
+sudo cp deploy/systemd/prox-{monitor,backup,restore-drill,cleanup}.{service,timer} /etc/systemd/system/
+sudo cp deploy/logrotate/prox /etc/logrotate.d/prox
+sudo systemctl daemon-reload
+sudo systemctl enable --now prox-monitor.timer prox-backup.timer prox-restore-drill.timer prox-cleanup.timer
+systemctl list-timers 'prox-*' --no-pager
+```
+
+The schedules are one-minute monitoring, daily encrypted backup, monthly
+restore proof, and weekly release cleanup. `Persistent=true` catches up a run
+missed while the host was offline.
 
 ## Budget and game policy
 

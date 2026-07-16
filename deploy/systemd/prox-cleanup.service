@@ -1,0 +1,15 @@
+[Unit]
+Description=Remove expired prox release artifacts safely
+After=docker.service prox-backup.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/prox/current
+ExecStart=/usr/bin/bash /opt/prox/current/scripts/deploy/cleanup.sh --apply
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/prox/current/releases

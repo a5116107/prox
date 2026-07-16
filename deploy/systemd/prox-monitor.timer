@@ -1,0 +1,13 @@
+[Unit]
+Description=Run prox production health probe every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+RandomizedDelaySec=10s
+AccuracySec=10s
+Persistent=true
+Unit=prox-monitor.service
+
+[Install]
+WantedBy=timers.target

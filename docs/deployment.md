@@ -19,14 +19,17 @@ frontend unit.
 /opt/prox/current/logs             new-api logs
 /var/lib/prox-hermes               Adapter writable state
 /etc/prox/hermes.env               Adapter secrets, mode 0600
+/var/backups/prox                  encrypted backup archives, mode 0700
+/etc/prox/backup-age.key           restore identity, mode 0600
 ```
 
 ## Initial installation
 
 ```bash
 sudo useradd --system --home /opt/prox --shell /usr/sbin/nologin prox || true
-sudo mkdir -p /opt/prox /etc/prox
+sudo mkdir -p /opt/prox /etc/prox /var/backups/prox
 sudo chown -R prox:prox /opt/prox
+sudo chmod 700 /var/backups/prox
 sudo -u prox git clone https://github.com/a5116107/prox.git /opt/prox/current
 cd /opt/prox/current
 cp .env.deploy.example .env.deploy
@@ -70,6 +73,33 @@ sudo systemctl enable --now prox-hermes-adapter
 sudo bash scripts/deploy/check-adapter-health.sh
 ```
 
+Install `age` and optional `rclone`, generate the backup identity, and write its
+public recipient to `.env.deploy`:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y age jq logrotate
+# Optional when BACKUP_RCLONE_DEST is configured:
+# sudo apt-get install -y rclone
+sudo age-keygen -o /etc/prox/backup-age.key
+sudo chmod 600 /etc/prox/backup-age.key
+recipient="$(sudo age-keygen -y /etc/prox/backup-age.key)"
+sudo sed -i "s|^# BACKUP_AGE_RECIPIENT=.*|BACKUP_AGE_RECIPIENT=$recipient|" .env.deploy
+printf '%s\n' 'BACKUP_AGE_IDENTITY_FILE=/etc/prox/backup-age.key' | sudo tee -a .env.deploy >/dev/null
+sudo cp deploy/systemd/prox-{monitor,backup,restore-drill,cleanup}.{service,timer} /etc/systemd/system/
+sudo cp deploy/logrotate/prox /etc/logrotate.d/prox
+sudo chmod 644 /etc/logrotate.d/prox
+sudo logrotate --debug /etc/logrotate.d/prox
+sudo systemctl daemon-reload
+sudo systemctl enable --now prox-monitor.timer prox-backup.timer prox-restore-drill.timer prox-cleanup.timer
+sudo bash scripts/deploy/backup.sh
+sudo bash scripts/deploy/restore-drill.sh
+```
+
+Store a second copy of the age identity outside this host. When using rclone,
+place its root-owned configuration at `/etc/rclone/rclone.conf` and set a
+dedicated `BACKUP_RCLONE_DEST` prefix.
+
 Image settings saved in Agent Ops are read through the internal no-store
 endpoint and become effective after at most `IMAGE_CONFIG_CACHE_TTL_SECONDS`;
 the Adapter does not need a restart. Verify the endpoint and Adapter-selected
@@ -106,7 +136,9 @@ git -C /opt/prox/current rev-parse HEAD
 curl -fsS http://127.0.0.1:3000/api/status
 curl -fsS http://127.0.0.1:3000/release-marker.txt
 sudo bash scripts/deploy/check-adapter-health.sh
+sudo bash scripts/deploy/monitor.sh | jq .
 systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
+systemctl list-timers 'prox-*' --no-pager
 sudo bash -c '
   set -a; source /etc/prox/hermes.env; set +a
   health_url="${HERMES_ADAPTER_HEALTH_URL:-http://${HERMES_ADAPTER_HOST}:${HERMES_ADAPTER_PORT:-18181}/health}"
@@ -118,7 +150,10 @@ The checkout must list only GitHub as `origin`. The image tag, image ID, commit,
 and marker must match the release metadata under `releases/current.env`.
 Adapter `FragmentPath` must resolve to `prox-hermes-adapter.service`, its
 environment file to `/etc/prox/hermes.env`, its user to `prox`, and its restart
-count must remain stable.
+count must remain stable. The monitor payload must report every check as true,
+and both backup and restore-drill services must have a successful recent run.
+Existing containers receive the bounded JSON logging policy when they are next
+recreated; `release.sh` applies it to `new-api` on every image switch.
 
 ## Firewall
 

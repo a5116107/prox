@@ -4379,12 +4379,8 @@ def _image_env_config():
         "size": str(IMAGE_SIZE or "1024x1024").strip() or "1024x1024",
         "timeout_seconds": _image_number(IMAGE_TIMEOUT, 180, 1, 600),
         "retry_limit": _image_number(IMAGE_RETRY_LIMIT, 2, 1, 5, integer=True),
-        "retry_base_delay_seconds": _image_number(
-            IMAGE_RETRY_BASE_DELAY, 3, 0, 300
-        ),
-        "retry_max_delay_seconds": _image_number(
-            IMAGE_RETRY_MAX_DELAY, 15, 0, 300
-        ),
+        "retry_base_delay_seconds": _image_number(IMAGE_RETRY_BASE_DELAY, 3, 0, 300),
+        "retry_max_delay_seconds": _image_number(IMAGE_RETRY_MAX_DELAY, 15, 0, 300),
         "cooldown_seconds": _image_number(
             IMAGE_COOLDOWN_SECONDS, 45, 0, 86400, integer=True
         ),
@@ -4476,9 +4472,7 @@ def _get_image_runtime_config(force=False):
         fallback = dict(cached or _image_env_config())
         try:
             req = urllib.request.Request(
-                _chatops_url(
-                    base, "/api/agent/chatops/image-config", secret, "qq"
-                ),
+                _chatops_url(base, "/api/agent/chatops/image-config", secret, "qq"),
                 headers=_chatops_headers(secret, "qq"),
             )
             with urllib.request.urlopen(
@@ -4589,9 +4583,7 @@ def _image_retry_delay(attempt, config, error=None):
             delay = max(delay, float(retry_after))
         except (TypeError, ValueError):
             pass
-    return min(
-        float(config.get("retry_max_delay_seconds") or 0), max(0.0, delay)
-    )
+    return min(float(config.get("retry_max_delay_seconds") or 0), max(0.0, delay))
 
 
 def _call_image_service(prompt, runtime_config=None):
@@ -4765,12 +4757,10 @@ def _start_qq_image_job(
                             "room_id": room_id,
                             "user_id": user_id,
                             "status": "delivery_error",
-                            "latency_ms": int(
-                                (time.time() - delivery_started) * 1000
-                            ),
-                            "generated_url_available": str(photo_url).lower().startswith(
-                                ("http://", "https://")
-                            ),
+                            "latency_ms": int((time.time() - delivery_started) * 1000),
+                            "generated_url_available": str(photo_url)
+                            .lower()
+                            .startswith(("http://", "https://")),
                         }
                     )
                     return
@@ -5426,9 +5416,7 @@ def handle_onebot(req):
             reply_mid = send_qq_reply(
                 mt,
                 gid if mt == "group" else uid,
-                _human_image_error_message(
-                    username, reason, mt
-                ),
+                _human_image_error_message(username, reason, mt),
             )
             if mt == "group" and reply_mid:
                 _remember_recent_bot_group_reply(
@@ -5471,9 +5459,7 @@ def handle_onebot(req):
                     "cooldown_left": cooldown_left,
                 },
             )
-        _set_image_cooldown(
-            "qq", room_id, uid, image_config.get("cooldown_seconds")
-        )
+        _set_image_cooldown("qq", room_id, uid, image_config.get("cooldown_seconds"))
         _set_image_pending("qq", room_id, uid, image_prompt)
         ack = (
             f"@{username} 收到，这就开始画：{image_prompt[:60]}"

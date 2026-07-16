@@ -1,0 +1,19 @@
+[Unit]
+Description=Create encrypted prox production backup
+After=docker.service prox-hermes-adapter.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/prox/current
+Environment=RCLONE_CONFIG=/etc/rclone/rclone.conf
+ExecStart=/usr/bin/bash /opt/prox/current/scripts/deploy/backup.sh
+TimeoutStartSec=2h
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/prox -/etc/rclone
+ReadWritePaths=/var/backups/prox /tmp

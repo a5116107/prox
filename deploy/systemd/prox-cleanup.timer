@@ -1,0 +1,11 @@
+[Unit]
+Description=Run weekly prox release retention cleanup
+
+[Timer]
+OnCalendar=Sun *-*-* 05:20:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=prox-cleanup.service
+
+[Install]
+WantedBy=timers.target
