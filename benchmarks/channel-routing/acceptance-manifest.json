@@ -1,0 +1,24 @@
+{
+  "name": "channel-routing-health-selection",
+  "scenario": "Benchmark the in-memory healthy channel selection path with routing health enabled",
+  "targetRepo": ".",
+  "entryCommands": [
+    {
+      "id": "channel-routing-benchmark",
+      "command": "go test ./model -run \"^$\" -bench \"^BenchmarkGetRandomSatisfiedChannelWithRoutingHealth$\" -benchmem -benchtime=250ms -count=3",
+      "expectedExitCode": 0
+    }
+  ],
+  "acceptanceChecks": [
+    {
+      "id": "channel-routing-benchmark-passed",
+      "type": "command_exit_code",
+      "commandId": "channel-routing-benchmark",
+      "expected": 0
+    }
+  ],
+  "failureHints": [
+    "Run the benchmark command directly to inspect compilation, allocation, or routing selection failures.",
+    "Keep absolute latency thresholds out of this manifest because developer and CI hardware differ."
+  ]
+}

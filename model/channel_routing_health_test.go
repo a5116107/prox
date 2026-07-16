@@ -18,8 +18,8 @@ func resetChannelRoutingHealthForTest() {
 	channelRoutingHealthMu.Unlock()
 }
 
-func configureChannelRoutingTest(t *testing.T) {
-	t.Helper()
+func configureChannelRoutingTest(tb testing.TB) {
+	tb.Helper()
 
 	originalMemoryCacheEnabled := common.MemoryCacheEnabled
 	originalRedisEnabled := common.RedisEnabled
@@ -52,7 +52,7 @@ func configureChannelRoutingTest(t *testing.T) {
 	}
 	resetChannelRoutingHealthForTest()
 
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		common.MemoryCacheEnabled = originalMemoryCacheEnabled
 		common.RedisEnabled = originalRedisEnabled
 		common.ChannelRoutingHealthEnabled = originalHealthEnabled
@@ -65,6 +65,22 @@ func configureChannelRoutingTest(t *testing.T) {
 		channelsIDM = originalChannels
 		resetChannelRoutingHealthForTest()
 	})
+}
+
+func BenchmarkGetRandomSatisfiedChannelWithRoutingHealth(b *testing.B) {
+	configureChannelRoutingTest(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		selected, err := GetRandomSatisfiedChannelWithExclusions("default", "gpt-test", 0, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if selected == nil {
+			b.Fatal("expected a channel")
+		}
+	}
 }
 
 func TestGetRandomSatisfiedChannelExcludesAttemptedPeer(t *testing.T) {
