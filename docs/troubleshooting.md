@@ -21,7 +21,7 @@ Separate layers using response headers and logs:
 
 1. Static file 429: local web/proxy limiter.
 2. `/api/*` before channel selection: local global/search/critical limiter.
-3. Relay response with channel/upstream request ID: provider limit or account quota.
+3. `X-RateLimit-Scope: upstream-channel`: provider limit or account quota; `Retry-After` is the provider value when available, otherwise the configured channel cooldown.
 4. Repeated retries: inspect channel retry policy and circuit breaker.
 
 Do not globally disable all limits. Exempt static/internal health paths and tune authenticated API budgets independently.

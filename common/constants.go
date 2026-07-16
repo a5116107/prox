@@ -176,6 +176,13 @@ var RelayIdleConnTimeout int // unit is second
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 
+var ChannelRoutingHealthEnabled bool
+var ChannelRoutingFailureThreshold int
+var ChannelRoutingFailureWindowSeconds int
+var ChannelRoutingCooldownSeconds int
+var ChannelRoutingRateLimitCooldownSeconds int
+var ChannelRoutingLatencyBaselineMS int
+
 var GeminiSafetySetting string
 
 // https://docs.cohere.com/docs/safety-modes Type; NONE/CONTEXTUAL/STRICT

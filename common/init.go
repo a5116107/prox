@@ -108,6 +108,12 @@ func InitEnv() {
 	RelayIdleConnTimeout = GetEnvOrDefault("RELAY_IDLE_CONN_TIMEOUT", 90)
 	RelayMaxIdleConns = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS", 500)
 	RelayMaxIdleConnsPerHost = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS_PER_HOST", 100)
+	ChannelRoutingHealthEnabled = GetEnvOrDefaultBool("CHANNEL_ROUTING_HEALTH_ENABLE", true)
+	ChannelRoutingFailureThreshold = GetEnvOrDefault("CHANNEL_ROUTING_FAILURE_THRESHOLD", 3)
+	ChannelRoutingFailureWindowSeconds = GetEnvOrDefault("CHANNEL_ROUTING_FAILURE_WINDOW_SECONDS", 60)
+	ChannelRoutingCooldownSeconds = GetEnvOrDefault("CHANNEL_ROUTING_COOLDOWN_SECONDS", 30)
+	ChannelRoutingRateLimitCooldownSeconds = GetEnvOrDefault("CHANNEL_ROUTING_RATE_LIMIT_COOLDOWN_SECONDS", 20)
+	ChannelRoutingLatencyBaselineMS = GetEnvOrDefault("CHANNEL_ROUTING_LATENCY_BASELINE_MS", 2000)
 
 	// Initialize string variables with GetEnvOrDefaultString
 	GeminiSafetySetting = GetEnvOrDefaultString("GEMINI_SAFETY_SETTING", "BLOCK_NONE")

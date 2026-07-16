@@ -90,6 +90,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			setUpstreamRateLimitResponseHeaders(c, newAPIError.StatusCode)
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -208,6 +209,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		attemptStartedAt := time.Now()
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -221,12 +223,19 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
+			ttft := time.Duration(0)
+			if relayInfo.FirstResponseTime.After(attemptStartedAt) {
+				ttft = relayInfo.FirstResponseTime.Sub(attemptStartedAt)
+			}
+			model.RecordChannelRoutingSuccess(channel.Id, time.Since(attemptStartedAt), ttft)
 			relayInfo.LastError = nil
 			return
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+		model.RecordChannelRoutingFailure(channel.Id, newAPIError.StatusCode)
+		retryParam.ExcludeChannel(channel.Id)
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
@@ -311,6 +320,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return nil, types.NewError(fmt.Errorf("获取分组 %s 下模型 %s 的可用渠道失败（retry）: %s", selectGroup, info.OriginModelName, err.Error()), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if channel == nil {
+		if info.LastError != nil {
+			return nil, info.LastError
+		}
 		return nil, types.NewError(fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 
@@ -546,12 +558,16 @@ func RelayTask(c *gin.Context) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		attemptStartedAt := time.Now()
 		result, taskErr = relay.RelayTaskSubmit(c, relayInfo)
 		if taskErr == nil {
+			model.RecordChannelRoutingSuccess(channel.Id, time.Since(attemptStartedAt), 0)
 			break
 		}
 
 		if !taskErr.LocalError {
+			model.RecordChannelRoutingFailure(channel.Id, taskErr.StatusCode)
+			retryParam.ExcludeChannel(channel.Id)
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
@@ -607,7 +623,23 @@ func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
 	if taskErr.StatusCode == http.StatusTooManyRequests {
 		taskErr.Message = "当前分组上游负载已饱和，请稍后再试"
 	}
+	setUpstreamRateLimitResponseHeaders(c, taskErr.StatusCode)
 	c.JSON(taskErr.StatusCode, taskErr)
+}
+
+func setUpstreamRateLimitResponseHeaders(c *gin.Context, statusCode int) {
+	if c == nil || statusCode != http.StatusTooManyRequests {
+		return
+	}
+	c.Header("X-RateLimit-Scope", "upstream-channel")
+	if c.Writer.Header().Get("Retry-After") != "" {
+		return
+	}
+	retryAfter := common.ChannelRoutingRateLimitCooldownSeconds
+	if retryAfter <= 0 {
+		retryAfter = 1
+	}
+	c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 }
 
 func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
