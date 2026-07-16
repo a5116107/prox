@@ -928,6 +928,17 @@ type ManageRequest struct {
 	Mode   string `json:"mode"`
 }
 
+func adminQuotaMutationRequestID(c *gin.Context, userID int, mode string) string {
+	requestID := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if requestID == "" {
+		requestID = strings.TrimSpace(c.GetString(common.RequestIdKey))
+	}
+	if len(requestID) > 64 {
+		requestID = fmt.Sprintf("%x", common.Sha256Raw([]byte(requestID)))
+	}
+	return fmt.Sprintf("admin-quota:%d:%s:%s", userID, strings.TrimSpace(mode), requestID)
+}
+
 // ManageUser Only admin user can do this
 func ManageUser(c *gin.Context) {
 	var req ManageRequest
@@ -998,13 +1009,18 @@ func ManageUser(c *gin.Context) {
 		}
 		user.Role = common.RoleCommonUser
 	case "add_quota":
+		mutationRequestID := adminQuotaMutationRequestID(c, user.Id, req.Mode)
 		switch req.Mode {
 		case "add":
 			if req.Value <= 0 {
 				common.ApiErrorI18n(c, i18n.MsgUserQuotaChangeZero)
 				return
 			}
-			if err := model.IncreaseUserQuota(user.Id, req.Value, true); err != nil {
+			if err := model.ApplyUserQuotaMutation(model.UserQuotaMutation{
+				UserID: user.Id, DeltaQuota: req.Value, RequestID: mutationRequestID,
+				SourceType: "admin_quota", TransactionType: "admin_quota_add",
+				IdempotencyKey: mutationRequestID, Remark: "administrator quota credit",
+			}); err != nil {
 				common.ApiError(c, err)
 				return
 			}
@@ -1016,7 +1032,11 @@ func ManageUser(c *gin.Context) {
 				common.ApiErrorI18n(c, i18n.MsgUserQuotaChangeZero)
 				return
 			}
-			if err := model.DecreaseUserQuota(user.Id, req.Value, true); err != nil {
+			if err := model.ApplyUserQuotaMutation(model.UserQuotaMutation{
+				UserID: user.Id, DeltaQuota: -req.Value, RequestID: mutationRequestID,
+				SourceType: "admin_quota", TransactionType: "admin_quota_subtract",
+				IdempotencyKey: mutationRequestID, Remark: "administrator quota debit",
+			}); err != nil {
 				common.ApiError(c, err)
 				return
 			}
@@ -1024,8 +1044,12 @@ func ManageUser(c *gin.Context) {
 				"quota": logger.LogQuota(req.Value),
 			})
 		case "override":
+			if req.Value < 0 {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
 			oldQuota := user.Quota
-			if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", req.Value).Error; err != nil {
+			if err := model.SetUserQuotaBalance(user.Id, req.Value, mutationRequestID, "admin_quota", "administrator quota override"); err != nil {
 				common.ApiError(c, err)
 				return
 			}

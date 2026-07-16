@@ -177,22 +177,33 @@ func UpdateMidjourneyTaskBulk() {
 				if err != nil {
 					logger.LogError(ctx, "UpdateMidjourneyTask task error: "+err.Error())
 				} else if won && shouldReturnQuota {
-					err = model.IncreaseUserQuota(task.UserId, task.Quota, false)
+					mutationID := "midjourney:" + task.MjId + ":refund"
+					if len(mutationID) > 128 {
+						mutationID = "midjourney:" + fmt.Sprintf("%x", common.Sha256Raw([]byte(mutationID)))
+					}
+					applied, mutationErr := model.ApplyUserQuotaMutationWithResult(model.UserQuotaMutation{
+						UserID: task.UserId, DeltaQuota: task.Quota, RequestID: mutationID,
+						SourceType: "midjourney_task", TransactionType: "task_refund",
+						IdempotencyKey: mutationID, Remark: "midjourney task failed",
+					})
+					err = mutationErr
 					if err != nil {
 						logger.LogError(ctx, "fail to increase user quota: "+err.Error())
 					}
-					model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
-						UserId:    task.UserId,
-						LogType:   model.LogTypeRefund,
-						Content:   "",
-						ChannelId: task.ChannelId,
-						ModelName: service.CovertMjpActionToModelName(task.Action),
-						Quota:     task.Quota,
-						Other: map[string]interface{}{
-							"task_id": task.MjId,
-							"reason":  "构图失败",
-						},
-					})
+					if applied {
+						model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+							UserId:    task.UserId,
+							LogType:   model.LogTypeRefund,
+							Content:   "",
+							ChannelId: task.ChannelId,
+							ModelName: service.CovertMjpActionToModelName(task.Action),
+							Quota:     task.Quota,
+							Other: map[string]interface{}{
+								"task_id": task.MjId,
+								"reason":  "构图失败",
+							},
+						})
+					}
 				}
 			}
 		}

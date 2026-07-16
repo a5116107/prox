@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
@@ -27,8 +28,10 @@ type FundingSource interface {
 // ---------------------------------------------------------------------------
 
 type WalletFunding struct {
-	userId   int
-	consumed int // 实际预扣的用户额度
+	requestId  string
+	userId     int
+	consumed   int // 当前持久化预留额度
+	sourceType string
 }
 
 func (w *WalletFunding) Source() string { return BillingSourceWallet }
@@ -37,7 +40,7 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	if amount <= 0 {
 		return nil
 	}
-	if err := model.DecreaseUserQuota(w.userId, amount, false); err != nil {
+	if err := model.ReserveUserQuota(w.requestId, w.userId, amount, w.sourceType); err != nil {
 		return err
 	}
 	w.consumed = amount
@@ -45,22 +48,24 @@ func (w *WalletFunding) PreConsume(amount int) error {
 }
 
 func (w *WalletFunding) Settle(delta int) error {
-	if delta == 0 {
-		return nil
+	actualQuota := w.consumed + delta
+	if actualQuota < 0 {
+		return fmt.Errorf("wallet settlement quota cannot be negative: reserved=%d delta=%d", w.consumed, delta)
 	}
-	if delta > 0 {
-		return model.DecreaseUserQuota(w.userId, delta, false)
+	if err := model.SettleUserQuotaReservation(w.requestId, w.userId, actualQuota, w.sourceType); err != nil {
+		return err
 	}
-	return model.IncreaseUserQuota(w.userId, -delta, false)
+	w.consumed = actualQuota
+	return nil
 }
 
 func (w *WalletFunding) Refund() error {
 	if w.consumed <= 0 {
 		return nil
 	}
-	// IncreaseUserQuota 是 quota += N 的非幂等操作，不能重试，否则会多退额度。
-	// 订阅的 RefundSubscriptionPreConsume 有 requestId 幂等保护所以可以重试。
-	return model.IncreaseUserQuota(w.userId, w.consumed, false)
+	return refundWithRetry(func() error {
+		return model.RefundUserQuotaReservation(w.requestId, w.userId, "billing request failed")
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +107,16 @@ func (s *SubscriptionFunding) PreConsume(_ int) error {
 }
 
 func (s *SubscriptionFunding) Settle(delta int) error {
-	if delta == 0 {
-		return nil
+	actualQuota := s.preConsumed + int64(delta)
+	if actualQuota < 0 {
+		return fmt.Errorf("subscription settlement quota cannot be negative: reserved=%d delta=%d", s.preConsumed, delta)
 	}
-	return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta))
+	if err := model.SettleSubscriptionPreConsume(s.requestId, s.userId, s.subscriptionId, actualQuota); err != nil {
+		return err
+	}
+	s.AmountUsedAfter += int64(delta)
+	s.preConsumed = actualQuota
+	return nil
 }
 
 func (s *SubscriptionFunding) Refund() error {

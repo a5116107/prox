@@ -404,29 +404,47 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 }
 
 func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) (err error) {
-
+	if relayInfo == nil {
+		return errors.New("relay info is nil")
+	}
+	mutationID := fmt.Sprintf("legacy-billing:%s:%d", strings.TrimSpace(relayInfo.RequestId), quota)
+	if len(mutationID) > 128 {
+		mutationID = "legacy-billing:" + fmt.Sprintf("%x", common.Sha256Raw([]byte(mutationID)))
+	}
+	applied := false
 	// 1) Consume from wallet quota OR subscription item
-	if relayInfo != nil && relayInfo.BillingSource == BillingSourceSubscription {
+	if relayInfo.BillingSource == BillingSourceSubscription {
 		if relayInfo.SubscriptionId == 0 {
 			return errors.New("subscription id is missing")
 		}
 		delta := int64(quota)
 		if delta != 0 {
-			if err := model.PostConsumeUserSubscriptionDelta(relayInfo.SubscriptionId, delta); err != nil {
+			applied, err = model.PostConsumeUserSubscriptionDeltaIdempotentWithResult(
+				relayInfo.SubscriptionId,
+				delta,
+				mutationID,
+				"legacy_billing",
+				mutationID,
+			)
+			if err != nil {
 				return err
 			}
 			relayInfo.SubscriptionPostDelta += delta
 		}
 	} else {
-		// Wallet
-		if quota > 0 {
-			err = model.DecreaseUserQuota(relayInfo.UserId, quota, false)
-		} else {
-			err = model.IncreaseUserQuota(relayInfo.UserId, -quota, false)
+		if quota != 0 {
+			applied, err = model.ApplyUserQuotaMutationWithResult(model.UserQuotaMutation{
+				UserID: relayInfo.UserId, DeltaQuota: -quota, RequestID: mutationID,
+				SourceType: "legacy_billing", TransactionType: "legacy_billing",
+				IdempotencyKey: mutationID, Remark: "legacy billing settlement",
+			})
+			if err != nil {
+				return err
+			}
 		}
-		if err != nil {
-			return err
-		}
+	}
+	if quota == 0 || !applied {
+		return nil
 	}
 
 	if !relayInfo.IsPlayground {

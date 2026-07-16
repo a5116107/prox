@@ -637,11 +637,11 @@ func ApplyQuotaMutationTx(tx *gorm.DB, siteID string, userID int, delta int, poo
 		Remark:          strings.TrimSpace(remark),
 		MetadataJson:    strings.TrimSpace(metadataJson),
 	}
-	budgetRes := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&budgetTxn)
-	if budgetRes.Error != nil {
-		return budgetRes.Error
+	budgetClaimed, err := claimAgentBudgetTransactionTx(tx, &budgetTxn)
+	if err != nil {
+		return err
 	}
-	if budgetRes.RowsAffected == 0 {
+	if !budgetClaimed {
 		return nil
 	}
 	ledger := OpsFundLedger{
@@ -674,7 +674,11 @@ func ApplyQuotaMutationTx(tx *gorm.DB, siteID string, userID int, delta int, poo
 		if fund.BalanceQuota < delta {
 			return errors.New("ops fund insufficient")
 		}
-		if err := tx.Model(&User{}).Where("id = ?", userID).Update("quota", gorm.Expr("quota + ?", delta)).Error; err != nil {
+		if err := ApplyUserQuotaMutationTx(tx, UserQuotaMutation{
+			UserID: userID, DeltaQuota: delta, RequestID: idempotencyKey,
+			SourceType: sourceType, TransactionType: "ops_grant",
+			IdempotencyKey: "user:" + idempotencyKey, Remark: strings.TrimSpace(remark),
+		}); err != nil {
 			return err
 		}
 		if err := tx.Model(&AgentBudgetPool{}).Where("id = ?", pool.Id).Update("used_quota", gorm.Expr("used_quota + ?", delta)).Error; err != nil {
@@ -689,14 +693,11 @@ func ApplyQuotaMutationTx(tx *gorm.DB, siteID string, userID int, delta int, poo
 		}
 	} else {
 		abs := -delta
-		var user User
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "quota").Where("id = ?", userID).First(&user).Error; err != nil {
-			return err
-		}
-		if user.Quota < abs {
-			return errors.New("user quota insufficient")
-		}
-		if err := tx.Model(&User{}).Where("id = ?", userID).Update("quota", gorm.Expr("quota - ?", abs)).Error; err != nil {
+		if err := ApplyUserQuotaMutationTx(tx, UserQuotaMutation{
+			UserID: userID, DeltaQuota: -abs, RequestID: idempotencyKey,
+			SourceType: sourceType, TransactionType: "ops_charge",
+			IdempotencyKey: "user:" + idempotencyKey, Remark: strings.TrimSpace(remark),
+		}); err != nil {
 			return err
 		}
 		// pool.used_quota 不变(负向扣款不占日控)

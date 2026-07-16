@@ -84,15 +84,35 @@ func taskIsSubscription(task *model.Task) bool {
 	return task.PrivateData.BillingSource == BillingSourceSubscription && task.PrivateData.SubscriptionId > 0
 }
 
+func taskBillingMutationID(task *model.Task, stage string) string {
+	taskID := strings.TrimSpace(task.TaskID)
+	if taskID == "" {
+		taskID = fmt.Sprintf("db-%d", task.ID)
+	}
+	mutationID := fmt.Sprintf("task:%s:%s", taskID, strings.TrimSpace(stage))
+	if len(mutationID) > 128 {
+		mutationID = "task:" + fmt.Sprintf("%x", common.Sha256Raw([]byte(mutationID)))
+	}
+	return mutationID
+}
+
 // taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
-func taskAdjustFunding(task *model.Task, delta int) error {
+func taskAdjustFunding(task *model.Task, delta int, stage string) (bool, error) {
+	mutationID := taskBillingMutationID(task, stage)
 	if taskIsSubscription(task) {
-		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
+		return model.PostConsumeUserSubscriptionDeltaIdempotentWithResult(
+			task.PrivateData.SubscriptionId,
+			int64(delta),
+			mutationID,
+			"task_"+stage,
+			mutationID,
+		)
 	}
-	if delta > 0 {
-		return model.DecreaseUserQuota(task.UserId, delta, false)
-	}
-	return model.IncreaseUserQuota(task.UserId, -delta, false)
+	return model.ApplyUserQuotaMutationWithResult(model.UserQuotaMutation{
+		UserID: task.UserId, DeltaQuota: -delta, RequestID: mutationID,
+		SourceType: "task_billing", TransactionType: "task_" + stage,
+		IdempotencyKey: mutationID, Remark: "asynchronous task billing adjustment",
+	})
 }
 
 // taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
@@ -156,8 +176,12 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) {
 	}
 
 	// 1. 退还资金来源（钱包或订阅）
-	if err := taskAdjustFunding(task, -quota); err != nil {
+	applied, err := taskAdjustFunding(task, -quota, "refund")
+	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("退还资金来源失败 task %s: %s", task.TaskID, err.Error()))
+		return
+	}
+	if !applied {
 		return
 	}
 
@@ -206,8 +230,14 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	))
 
 	// 调整资金来源
-	if err := taskAdjustFunding(task, quotaDelta); err != nil {
+	stage := fmt.Sprintf("recalculate_%d", actualQuota)
+	applied, err := taskAdjustFunding(task, quotaDelta, stage)
+	if err != nil {
 		logger.LogError(ctx, fmt.Sprintf("差额结算资金调整失败 task %s: %s", task.TaskID, err.Error()))
+		return
+	}
+	if !applied {
+		task.Quota = actualQuota
 		return
 	}
 

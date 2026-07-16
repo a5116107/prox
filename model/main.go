@@ -262,6 +262,8 @@ func migrateDB() error {
 		&Channel{},
 		&Token{},
 		&User{},
+		&UserQuotaReservation{},
+		&UserQuotaTransaction{},
 		&PasskeyCredential{},
 		&Option{},
 		&Redemption{},
@@ -281,6 +283,7 @@ func migrateDB() error {
 		&SubscriptionOrder{},
 		&UserSubscription{},
 		&SubscriptionPreConsumeRecord{},
+		&SubscriptionQuotaTransaction{},
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
 		&CommunityBotReward{},
@@ -359,7 +362,7 @@ func migrateDB() error {
 			return err
 		}
 	}
-	return nil
+	return finalizeUserQuotaAccountingMigration()
 }
 
 func migrateDBFast() error {
@@ -373,6 +376,8 @@ func migrateDBFast() error {
 		{&Channel{}, "Channel"},
 		{&Token{}, "Token"},
 		{&User{}, "User"},
+		{&UserQuotaReservation{}, "UserQuotaReservation"},
+		{&UserQuotaTransaction{}, "UserQuotaTransaction"},
 		{&PasskeyCredential{}, "PasskeyCredential"},
 		{&Option{}, "Option"},
 		{&Redemption{}, "Redemption"},
@@ -392,6 +397,7 @@ func migrateDBFast() error {
 		{&SubscriptionOrder{}, "SubscriptionOrder"},
 		{&UserSubscription{}, "UserSubscription"},
 		{&SubscriptionPreConsumeRecord{}, "SubscriptionPreConsumeRecord"},
+		{&SubscriptionQuotaTransaction{}, "SubscriptionQuotaTransaction"},
 		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
 		{&UserOAuthBinding{}, "UserOAuthBinding"},
 		{&CommunityBotReward{}, "CommunityBotReward"},
@@ -494,7 +500,32 @@ func migrateDBFast() error {
 			return err
 		}
 	}
+	if err := finalizeUserQuotaAccountingMigration(); err != nil {
+		return err
+	}
 	common.SysLog("database migrated")
+	return nil
+}
+
+func finalizeUserQuotaAccountingMigration() error {
+	const repairID = "conditional-debit-rollout-v1"
+	repaired, err := repairAllNegativeUserQuotas(repairID, 10_000)
+	if err != nil {
+		return fmt.Errorf("failed to repair historical negative user quotas: %w", err)
+	}
+	if repaired > 0 {
+		common.SysLog(fmt.Sprintf("repaired %d historical negative user quota balances", repaired))
+	}
+	report, err := ReconcileUserQuotaAccounting(time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to reconcile user quota accounting: %w", err)
+	}
+	if report.NegativeUsers > 0 || report.OrphanReservations > 0 || report.ReservationLedgerMismatches > 0 {
+		return fmt.Errorf(
+			"user quota accounting reconciliation failed: negative=%d orphan=%d ledger_mismatch=%d",
+			report.NegativeUsers, report.OrphanReservations, report.ReservationLedgerMismatches,
+		)
+	}
 	return nil
 }
 

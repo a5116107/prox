@@ -118,6 +118,8 @@ func main() {
 
 	// Subscription quota reset task (daily/weekly/monthly/custom)
 	service.StartSubscriptionQuotaResetTask()
+	// Refund wallet holds left active by interrupted requests.
+	service.StartUserQuotaReservationTask()
 
 	// Operations reward budgets reset once per local calendar day.
 	service.StartOpsDailyBudgetResetTask()

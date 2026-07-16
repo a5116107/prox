@@ -127,7 +127,7 @@ func Redeem(key string, userId int) (quota int, err error) {
 	}
 	common.RandomSleep()
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Set("gorm:query_option", "FOR UPDATE").Where(keyCol+" = ?", key).First(redemption).Error
+		err := lockForUpdate(tx).Where(keyCol+" = ?", key).First(redemption).Error
 		if err != nil {
 			return errors.New("无效的兑换码")
 		}
@@ -137,7 +137,12 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
 			return errors.New("该兑换码已过期")
 		}
-		err = tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", redemption.Quota)).Error
+		idempotencyKey := fmt.Sprintf("redemption:%d", redemption.Id)
+		err = ApplyUserQuotaMutationTx(tx, UserQuotaMutation{
+			UserID: userId, DeltaQuota: redemption.Quota, RequestID: idempotencyKey,
+			SourceType: "redemption", TransactionType: "redemption_credit",
+			IdempotencyKey: idempotencyKey, Remark: fmt.Sprintf("redemption code %d", redemption.Id),
+		})
 		if err != nil {
 			return err
 		}

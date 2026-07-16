@@ -42,6 +42,7 @@ func setupRewardLedgerTestDB(t *testing.T) {
 		&User{},
 		&AgentBudgetPool{},
 		&AgentBudgetTransaction{},
+		&UserQuotaTransaction{},
 		&OpsFundAccount{},
 		&OpsFundLedger{},
 		&CommunityBotReward{},
@@ -104,6 +105,33 @@ func TestGrantCommunityBotRewardIfNeededUsesCommunityBudgetPool(t *testing.T) {
 	var fresh User
 	require.NoError(t, DB.First(&fresh, user.Id).Error)
 	require.Equal(t, 500000, fresh.Quota)
+}
+
+func TestBudgetGrantReplaySucceedsAfterCapacityIsConsumedAndRejectsConflict(t *testing.T) {
+	setupRewardLedgerTestDB(t)
+	operation_setting.GetAgentSetting().SiteID = "test-site"
+	operation_setting.GetAgentSetting().ActivityBudgetQuota = 10
+	user := User{
+		Username: "budget-replay", Password: "Password123!", DisplayName: "budget replay",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "aff-budget-replay",
+	}
+	require.NoError(t, DB.Create(&user).Error)
+
+	grant := func(quota int) error {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			return GrantQuotaFromBudgetPoolWithSourceTx(tx, user.Id, "activity", quota, "budget-replay-key", "replay", "test_reward", "")
+		})
+	}
+	require.NoError(t, grant(10))
+	require.NoError(t, grant(10))
+	require.ErrorIs(t, grant(9), ErrBudgetAdjustmentIdempotencyConflict)
+
+	var fresh User
+	require.NoError(t, DB.First(&fresh, user.Id).Error)
+	require.Equal(t, 10, fresh.Quota)
+	var walletRows int64
+	require.NoError(t, DB.Model(&UserQuotaTransaction{}).Where("idempotency_key = ?", "user:budget-replay-key").Count(&walletRows).Error)
+	require.Equal(t, int64(1), walletRows)
 }
 
 func TestUserCheckinByChannelUsesActivityBudgetPool(t *testing.T) {

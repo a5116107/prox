@@ -98,6 +98,36 @@ func ensureAgentBudgetPoolTx(tx *gorm.DB, siteID string, poolType string, budget
 	return &pool, nil
 }
 
+func claimAgentBudgetTransactionTx(tx *gorm.DB, transaction *AgentBudgetTransaction) (bool, error) {
+	if tx == nil || transaction == nil {
+		return false, errors.New("budget transaction context is nil")
+	}
+	claim := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(transaction)
+	if claim.Error != nil {
+		return false, claim.Error
+	}
+	if claim.RowsAffected == 1 {
+		return true, nil
+	}
+	var existing AgentBudgetTransaction
+	if err := tx.Where("idempotency_key = ?", transaction.IdempotencyKey).First(&existing).Error; err != nil {
+		return false, err
+	}
+	if existing.SiteId != transaction.SiteId ||
+		existing.PoolId != transaction.PoolId ||
+		existing.PoolType != transaction.PoolType ||
+		existing.UserId != transaction.UserId ||
+		existing.ActionId != transaction.ActionId ||
+		existing.SourceType != transaction.SourceType ||
+		existing.TransactionType != transaction.TransactionType ||
+		existing.Quota != transaction.Quota ||
+		existing.SettlementId != transaction.SettlementId ||
+		existing.MutationIndex != transaction.MutationIndex {
+		return false, fmt.Errorf("%w: idempotency_key=%s", ErrBudgetAdjustmentIdempotencyConflict, transaction.IdempotencyKey)
+	}
+	return false, nil
+}
+
 func GrantQuotaFromBudgetPoolWithSourceTx(tx *gorm.DB, userId int, poolType string, quota int, idempotencyKey string, remark string, sourceType string, metadataJson string) error {
 	if tx == nil {
 		return errors.New("db transaction is nil")
@@ -127,16 +157,9 @@ func GrantQuotaFromBudgetPoolWithSourceTx(tx *gorm.DB, userId int, poolType stri
 	}
 
 	available := pool.TotalQuota - pool.UsedQuota - pool.FrozenQuota
-	if available < quota {
-		return fmt.Errorf("%w: available=%d required=%d pool=%s site=%s date=%s",
-			ErrBudgetPoolQuotaInsufficient, available, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
-	}
 	fund, err := ensureOpsFundAccountTx(tx, siteID, "operations")
 	if err != nil {
 		return err
-	}
-	if fund.BalanceQuota < quota {
-		return fmt.Errorf("%w: balance=%d required=%d site=%s pool=%s", ErrOpsFundQuotaInsufficient, fund.BalanceQuota, quota, siteID, strings.TrimSpace(poolType))
 	}
 	sourceType = strings.TrimSpace(sourceType)
 	if sourceType == "" {
@@ -160,19 +183,29 @@ func GrantQuotaFromBudgetPoolWithSourceTx(tx *gorm.DB, userId int, poolType stri
 		Remark:          strings.TrimSpace(remark),
 		MetadataJson:    strings.TrimSpace(metadataJson),
 	}
-	res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&txn)
-	if res.Error != nil {
-		return res.Error
+	claimed, err := claimAgentBudgetTransactionTx(tx, &txn)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	if !claimed {
 		return nil
+	}
+	if available < quota {
+		return fmt.Errorf("%w: available=%d required=%d pool=%s site=%s date=%s",
+			ErrBudgetPoolQuotaInsufficient, available, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
+	}
+	if fund.BalanceQuota < quota {
+		return fmt.Errorf("%w: balance=%d required=%d site=%s pool=%s", ErrOpsFundQuotaInsufficient, fund.BalanceQuota, quota, siteID, strings.TrimSpace(poolType))
 	}
 	if err := tx.Model(&AgentBudgetPool{}).Where("id = ?", pool.Id).
 		Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error; err != nil {
 		return err
 	}
-	if err := tx.Model(&User{}).Where("id = ?", userId).
-		Update("quota", gorm.Expr("quota + ?", quota)).Error; err != nil {
+	if err := ApplyUserQuotaMutationTx(tx, UserQuotaMutation{
+		UserID: userId, DeltaQuota: quota, RequestID: idempotencyKey,
+		SourceType: sourceType, TransactionType: "budget_grant",
+		IdempotencyKey: "user:" + idempotencyKey, Remark: strings.TrimSpace(remark),
+	}); err != nil {
 		return err
 	}
 	newBal := fund.BalanceQuota - quota
@@ -240,10 +273,6 @@ func ReserveQuotaFromBudgetPoolWithSourceTx(tx *gorm.DB, userId int, poolType st
 		return err
 	}
 	available := pool.TotalQuota - pool.UsedQuota - pool.FrozenQuota
-	if available < quota {
-		return fmt.Errorf("%w: available=%d required=%d pool=%s site=%s date=%s",
-			ErrBudgetPoolQuotaInsufficient, available, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
-	}
 
 	settlementID, mutationIndex, actionID := quotaReplayFieldsFromMetadata(idempotencyKey, "", 0)
 	txn := AgentBudgetTransaction{
@@ -261,12 +290,16 @@ func ReserveQuotaFromBudgetPoolWithSourceTx(tx *gorm.DB, userId int, poolType st
 		IdempotencyKey:  idempotencyKey,
 		Remark:          strings.TrimSpace(remark),
 	}
-	res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&txn)
-	if res.Error != nil {
-		return res.Error
+	claimed, err := claimAgentBudgetTransactionTx(tx, &txn)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	if !claimed {
 		return nil
+	}
+	if available < quota {
+		return fmt.Errorf("%w: available=%d required=%d pool=%s site=%s date=%s",
+			ErrBudgetPoolQuotaInsufficient, available, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
 	}
 	if err := tx.Model(&AgentBudgetPool{}).Where("id = ?", pool.Id).
 		Update("frozen_quota", gorm.Expr("frozen_quota + ?", quota)).Error; err != nil {
@@ -357,10 +390,6 @@ func ConsumeReservedQuotaFromBudgetPoolTx(tx *gorm.DB, userId int, poolType stri
 	if err != nil {
 		return err
 	}
-	if pool.FrozenQuota < quota {
-		return fmt.Errorf("budget pool reserved quota insufficient: frozen=%d required=%d pool=%s site=%s date=%s",
-			pool.FrozenQuota, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
-	}
 	available := pool.TotalQuota - pool.UsedQuota - pool.FrozenQuota
 
 	settlementID, mutationIndex, actionID := quotaReplayFieldsFromMetadata(idempotencyKey, "", 0)
@@ -379,12 +408,16 @@ func ConsumeReservedQuotaFromBudgetPoolTx(tx *gorm.DB, userId int, poolType stri
 		IdempotencyKey:  idempotencyKey,
 		Remark:          strings.TrimSpace(remark),
 	}
-	res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&txn)
-	if res.Error != nil {
-		return res.Error
+	claimed, err := claimAgentBudgetTransactionTx(tx, &txn)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	if !claimed {
 		return nil
+	}
+	if pool.FrozenQuota < quota {
+		return fmt.Errorf("budget pool reserved quota insufficient: frozen=%d required=%d pool=%s site=%s date=%s",
+			pool.FrozenQuota, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
 	}
 	poolUpdate := tx.Model(&AgentBudgetPool{}).
 		Where("id = ? AND frozen_quota >= ?", pool.Id, quota).
@@ -399,6 +432,9 @@ func ConsumeReservedQuotaFromBudgetPoolTx(tx *gorm.DB, userId int, poolType stri
 		return fmt.Errorf("budget pool reserved quota insufficient: frozen=%d required=%d pool=%s site=%s date=%s",
 			pool.FrozenQuota, quota, pool.PoolType, pool.SiteId, pool.BudgetDate)
 	}
-	return tx.Model(&User{}).Where("id = ?", userId).
-		Update("quota", gorm.Expr("quota + ?", quota)).Error
+	return ApplyUserQuotaMutationTx(tx, UserQuotaMutation{
+		UserID: userId, DeltaQuota: quota, RequestID: idempotencyKey,
+		SourceType: "consume_frozen", TransactionType: "budget_consume",
+		IdempotencyKey: "user:" + idempotencyKey, Remark: strings.TrimSpace(remark),
+	})
 }

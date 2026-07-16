@@ -94,6 +94,14 @@ func GetUserCache(userId int) (userCache *UserBase, err error) {
 	// Try getting from Redis first
 	userCache, err = cacheGetUserBase(userId)
 	if err == nil {
+		// Quota is a strongly consistent billing field. Identity and preferences
+		// may use Redis, but every cache hit refreshes quota from the ledger-backed
+		// database so transaction-local grants and charges cannot leave stale funds.
+		freshQuota, quotaErr := GetUserQuota(userId, true)
+		if quotaErr != nil {
+			return nil, quotaErr
+		}
+		userCache.Quota = freshQuota
 		return userCache, nil
 	}
 
@@ -129,31 +137,6 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 		return nil, err
 	}
 	return &userCache, nil
-}
-
-// Add atomic quota operations using hash fields
-func cacheIncrUserQuota(userId int, delta int64) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	return cacheIncrUserQuotaEnabled(userId, delta)
-}
-
-func cacheIncrUserQuotaEnabled(userId int, delta int64) error {
-	return common.RedisHIncrBy(getUserCacheKey(userId), "Quota", delta)
-}
-
-func scheduleUserQuotaCacheIncrement(userId int, delta int64) {
-	if !common.RedisEnabled {
-		return
-	}
-	go func() {
-		_ = cacheIncrUserQuotaEnabled(userId, delta)
-	}()
-}
-
-func cacheDecrUserQuota(userId int, delta int64) error {
-	return cacheIncrUserQuota(userId, -delta)
 }
 
 // Helper functions to get individual fields if needed

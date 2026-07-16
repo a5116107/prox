@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -100,6 +101,28 @@ func TestRechargeWaffoPancake_RejectsMismatchedPaymentMethod(t *testing.T) {
 	require.NotNil(t, topUp)
 	assert.Equal(t, common.TopUpStatusPending, topUp.Status)
 	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 101))
+}
+
+func TestRechargeEpayCreditsOrderAndJournalAtomicallyOnce(t *testing.T) {
+	truncateTables(t)
+	insertUserForPaymentGuardTest(t, 102, 0)
+	insertTopUpForPaymentGuardTest(t, "epay-atomic-credit", 102, PaymentProviderEpay)
+	expectedQuota := int(decimal.NewFromInt(2).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).IntPart())
+
+	topUp, quota, credited, err := RechargeEpay("epay-atomic-credit", "alipay")
+	require.NoError(t, err)
+	require.True(t, credited)
+	require.Equal(t, expectedQuota, quota)
+	require.Equal(t, common.TopUpStatusSuccess, topUp.Status)
+	require.Equal(t, expectedQuota, getUserQuotaForPaymentGuardTest(t, 102))
+
+	_, _, credited, err = RechargeEpay("epay-atomic-credit", "alipay")
+	require.NoError(t, err)
+	require.False(t, credited)
+	require.Equal(t, expectedQuota, getUserQuotaForPaymentGuardTest(t, 102))
+	var journalCount int64
+	require.NoError(t, DB.Model(&UserQuotaTransaction{}).Where("request_id = ?", "topup:"+itoa(topUp.Id)).Count(&journalCount).Error)
+	require.Equal(t, int64(1), journalCount)
 }
 
 func TestUpdatePendingTopUpStatus_RejectsMismatchedPaymentProvider(t *testing.T) {
