@@ -93,7 +93,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate shell scripts
-        run: shellcheck scripts/deploy/*.sh scripts/test/*.sh
+        run: shellcheck scripts/deploy/*.sh scripts/deploy/tests/*.sh scripts/test/*.sh
+      - name: Test Adapter health discovery
+        run: bash scripts/deploy/tests/adapter-health.test.sh
       - name: Validate production Compose
         run: docker compose --env-file .env.deploy.example -f compose.prod.yml config --quiet
       - name: Validate development Compose

@@ -9,6 +9,7 @@ ENV_FILE="${ENV_FILE:-$REPO_ROOT/.env.deploy}"
 RELEASES_DIR="${RELEASES_DIR:-$REPO_ROOT/releases}"
 NEWAPI_CONTAINER="${NEWAPI_CONTAINER:-new-api}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+HERMES_ADAPTER_ENV_FILE="${HERMES_ADAPTER_ENV_FILE:-/etc/prox/hermes.env}"
 
 log() {
   printf '[prox-deploy] %s\n' "$*"
@@ -33,6 +34,67 @@ load_deploy_env() {
 
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
+
+read_hermes_adapter_env_value() {
+  local key="$1" env_file="${HERMES_ADAPTER_ENV_FILE:-/etc/prox/hermes.env}"
+  [[ -f "$env_file" ]] || return 0
+
+  (
+    unset "$key"
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+    printf '%s' "${!key:-}"
+  )
+}
+
+resolve_hermes_adapter_health_url() {
+  local configured_url configured_host configured_port
+  local health_url host port authority
+
+  configured_url="$(read_hermes_adapter_env_value HERMES_ADAPTER_HEALTH_URL)" || return 1
+  configured_host="$(read_hermes_adapter_env_value HERMES_ADAPTER_HOST)" || return 1
+  configured_port="$(read_hermes_adapter_env_value HERMES_ADAPTER_PORT)" || return 1
+
+  health_url="${HERMES_ADAPTER_HEALTH_URL:-$configured_url}"
+  if [[ -n "$health_url" ]]; then
+    case "$health_url" in
+      http://*|https://*) printf '%s\n' "$health_url" ;;
+      *) log "invalid HERMES_ADAPTER_HEALTH_URL: expected http:// or https://" >&2; return 2 ;;
+    esac
+    return 0
+  fi
+
+  host="${HERMES_ADAPTER_HOST:-${configured_host:-127.0.0.1}}"
+  port="${HERMES_ADAPTER_PORT:-${configured_port:-18181}}"
+  [[ -n "$host" && "$host" != *[[:space:]/]* ]] || {
+    log "invalid HERMES_ADAPTER_HOST" >&2
+    return 2
+  }
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    log "invalid HERMES_ADAPTER_PORT: $port" >&2
+    return 2
+  fi
+
+  authority="$host"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    authority="[$host]"
+  fi
+  printf 'http://%s:%s/health\n' "$authority" "$port"
+}
+
+check_hermes_adapter_health() {
+  local health_url="${1:-}" body
+  [[ -n "$health_url" ]] || health_url="$(resolve_hermes_adapter_health_url)" || return 1
+  body="$(curl --fail --silent --show-error \
+    --max-time "${HERMES_ADAPTER_HEALTH_TIMEOUT:-5}" "$health_url")" || return 1
+  [[ "$body" == *'"ok": true'* || "$body" == *'"ok":true'* ]] || {
+    log "Hermes adapter returned an unexpected health response" >&2
+    return 1
+  }
+  printf '%s\n' "$body"
 }
 
 set_env_value() {

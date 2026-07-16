@@ -33,9 +33,11 @@ minimum_kb="$(( ${MIN_FREE_GB:-8} * 1024 * 1024 ))"
 (( available_kb >= minimum_kb )) || die "less than ${MIN_FREE_GB:-8} GiB is free on the release filesystem"
 
 if [[ "${SKIP_ADAPTER_CHECK:-0}" != "1" ]]; then
-  adapter_health="$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18181/health || true)"
-  [[ "$adapter_health" == *'"ok": true'* || "$adapter_health" == *'"ok":true'* ]] \
-    || die "Hermes adapter health check failed; set SKIP_ADAPTER_CHECK=1 only for adapter bootstrap"
+  adapter_health_url="$(resolve_hermes_adapter_health_url)" \
+    || die "Hermes adapter health address is invalid"
+  check_hermes_adapter_health "$adapter_health_url" >/dev/null \
+    || die "Hermes adapter health check failed at $adapter_health_url; set SKIP_ADAPTER_CHECK=1 only for adapter bootstrap"
+  log "Hermes adapter health check passed at $adapter_health_url"
 fi
 
 log "preflight passed"

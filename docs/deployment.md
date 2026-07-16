@@ -33,36 +33,43 @@ cp .env.deploy.example .env.deploy
 sudo chmod 600 .env.deploy
 ```
 
-Fill `.env.deploy`, then install Adapter:
+Fill `.env.deploy`, create the production Compose network, then install Adapter:
 
 ```bash
+docker compose --env-file .env.deploy -f compose.prod.yml up -d postgres redis oauth-worker
 sudo python3 -m venv /opt/prox/venv
 sudo /opt/prox/venv/bin/pip install \
   -r integrations/newapi-hermes-adapter/requirements.txt
 sudo cp integrations/newapi-hermes-adapter/.env.example /etc/prox/hermes.env
+adapter_gateway="$(docker network inspect prox-prod_new-api-network \
+  --format '{{(index .IPAM.Config 0).Gateway}}')"
+sudo sed -i "s/^HERMES_ADAPTER_HOST=.*/HERMES_ADAPTER_HOST=$adapter_gateway/" /etc/prox/hermes.env
 sudo chmod 600 /etc/prox/hermes.env
 sudo cp deploy/systemd/prox-hermes-adapter.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now prox-hermes-adapter
 ```
 
-Set `IMAGE_API_BASE_URL`, `IMAGE_API_KEY`, and `IMAGE_MODEL` in
-`/etc/prox/hermes.env` before starting the Adapter. The production image key
-must live only in that mode-`0600` environment file. Validate the configured
-provider without printing the key:
+Set `HERMES_ADAPTER_KEY`/`GAME_ADMIN_KEY` to the same value as
+`HERMES_SHARED_KEY` in `.env.deploy`. Set `IMAGE_API_BASE_URL`,
+`IMAGE_API_KEY`, and `IMAGE_MODEL` in `/etc/prox/hermes.env` before starting
+the Adapter. The production image key must live only in that mode-`0600`
+environment file. Validate the configured provider without printing the key,
+then start the unit:
 
 ```bash
 sudo bash -c 'set -a; source /etc/prox/hermes.env; set +a; \
   curl -fsS -H "Authorization: Bearer $IMAGE_API_KEY" \
   "$IMAGE_API_BASE_URL/models" | grep -q "gpt-image-2"'
+sudo systemctl enable --now prox-hermes-adapter
+sudo bash scripts/deploy/check-adapter-health.sh
 ```
 
-Start stateful services and release the application image:
+Release the application image:
 
 ```bash
-docker compose --env-file .env.deploy -f compose.prod.yml up -d postgres redis oauth-worker new-api-proxy
 bash scripts/deploy/preflight.sh
 bash scripts/deploy/release.sh
+docker compose --env-file .env.deploy -f compose.prod.yml up -d --no-deps new-api-proxy
 ```
 
 For the first release, set `SKIP_ADAPTER_CHECK=1` only while bootstrapping Adapter health.
@@ -76,7 +83,7 @@ git -C /opt/prox/current status --short --branch
 git -C /opt/prox/current rev-parse HEAD
 curl -fsS http://127.0.0.1:3000/api/status
 curl -fsS http://127.0.0.1:3000/release-marker.txt
-curl -fsS http://127.0.0.1:18181/health
+sudo bash scripts/deploy/check-adapter-health.sh
 systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
 ```
 
@@ -88,4 +95,7 @@ count must remain stable.
 
 ## Firewall
 
-Expose only 80/443 publicly. Bind new-api and Adapter to loopback. Restrict SSH by source and key authentication. PostgreSQL and Redis remain on the Compose network.
+Expose only 80/443 publicly. Bind new-api to loopback and Adapter to the
+`prox-prod` Compose bridge gateway recorded in `/etc/prox/hermes.env`; do not
+publish port 18181. Restrict SSH by source and key authentication. PostgreSQL
+and Redis remain on the Compose network.

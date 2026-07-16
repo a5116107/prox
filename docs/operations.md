@@ -7,7 +7,7 @@ docker compose --env-file .env.deploy -f compose.prod.yml ps
 docker inspect new-api --format '{{.Config.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
 systemctl is-active prox-hermes-adapter
 curl -fsS http://127.0.0.1:3000/api/status
-curl -fsS http://127.0.0.1:18181/health
+sudo bash scripts/deploy/check-adapter-health.sh
 df -h /
 docker system df
 ```
@@ -28,7 +28,7 @@ docker inspect new-api --format '{{json .Mounts}}'
 curl -fsS http://127.0.0.1:3000/release-marker.txt
 curl -fsS http://127.0.0.1:3000/api/status
 systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
-curl -fsS http://127.0.0.1:18181/health
+sudo bash scripts/deploy/check-adapter-health.sh
 docker exec new-api sh -c 'wget -qO- http://host.docker.internal:18181/health'
 ```
 

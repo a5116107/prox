@@ -31,7 +31,7 @@ Do not globally disable all limits. Exempt static/internal health paths and tune
 ```bash
 systemctl status prox-hermes-adapter --no-pager
 journalctl -u prox-hermes-adapter -n 200 --no-pager
-curl -fsS http://127.0.0.1:18181/health
+sudo bash scripts/deploy/check-adapter-health.sh
 docker exec new-api getent hosts host.docker.internal
 ```
 

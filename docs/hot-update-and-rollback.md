@@ -54,7 +54,7 @@ Adapter state remains under `/var/lib/prox-hermes`. Update its virtual environme
 ```bash
 sudo /opt/prox/venv/bin/pip install -r integrations/newapi-hermes-adapter/requirements.txt
 sudo systemctl restart prox-hermes-adapter
-curl -fsS http://127.0.0.1:18181/health
+sudo bash scripts/deploy/check-adapter-health.sh
 ```
 
 Core API traffic remains available while Adapter restarts. Schedule Adapter restarts outside active game rounds.
