@@ -975,3 +975,38 @@ def test_image_delivery_fallback_does_not_expose_base64_payload(adapter_loader):
 
     assert "private-image-payload" not in message
     assert "QQ" in message
+
+
+def test_image_worker_error_is_reported_redacted_and_clears_pending(
+    adapter_loader, monkeypatch
+):
+    adapter = adapter_loader(IMAGE_API_KEY="image-test-key")
+    replies = []
+    logs = []
+    adapter._set_image_pending("qq", "room-1", "user-1", "draw a dashboard")
+
+    def fail_image_service(prompt):
+        raise RuntimeError("worker failed for user@example.com")
+
+    monkeypatch.setattr(adapter, "_call_image_service", fail_image_service)
+    monkeypatch.setattr(
+        adapter,
+        "send_qq_reply",
+        lambda *args: replies.append(args) or "worker-error-message-id",
+    )
+    monkeypatch.setattr(adapter, "log", lambda event: logs.append(event))
+
+    def run_inline(job, **_kwargs):
+        job()
+        return True
+
+    monkeypatch.setattr(adapter, "_submit_background", run_inline)
+
+    adapter._start_qq_image_job(
+        "private", "user-1", "room-1", "user-1", "member", "draw a dashboard"
+    )
+
+    assert len(replies) == 1
+    assert logs[-1]["status"] == "worker_error"
+    assert logs[-1]["detail"] == "worker failed for <redacted-email>"
+    assert adapter._get_image_pending("qq", "room-1", "user-1") is None
