@@ -120,6 +120,8 @@ func main() {
 	service.StartSubscriptionQuotaResetTask()
 	// Refund wallet holds left active by interrupted requests.
 	service.StartUserQuotaReservationTask()
+	// Resume asynchronous task billing outbox steps on every node.
+	service.StartTaskBillingOperationTask()
 
 	// Operations reward budgets reset once per local calendar day.
 	service.StartOpsDailyBudgetResetTask()

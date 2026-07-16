@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -19,6 +21,65 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+func failMidjourneyTask(ctx context.Context, task *model.Midjourney, reason string) error {
+	if task == nil || task.Status == "FAILURE" || task.Status == "SUCCESS" {
+		return nil
+	}
+	fromStatus := task.Status
+	task.Status = "FAILURE"
+	task.Progress = "100%"
+	task.FailReason = reason
+	task.FinishTime = time.Now().UnixNano() / int64(time.Millisecond)
+	won, err := service.FinalizeMidjourneyTransition(ctx, task, fromStatus, true, reason)
+	if err != nil {
+		return err
+	}
+	if !won {
+		logger.LogInfo(ctx, fmt.Sprintf("Midjourney task %s already transitioned", task.MjId))
+	}
+	return nil
+}
+
+func fetchMidjourneyTasks(ctx context.Context, channel *model.Channel, taskIds []string) ([]dto.MidjourneyDto, error) {
+	if channel == nil {
+		return nil, errors.New("Midjourney channel is nil")
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(channel.GetBaseURL()), "/")
+	if baseURL == "" {
+		return nil, errors.New("Midjourney channel base URL is empty")
+	}
+	requestURL := fmt.Sprintf("%s/mj/task/list-by-condition", baseURL)
+	body, err := json.Marshal(map[string]any{"ids": taskIds})
+	if err != nil {
+		return nil, err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, requestURL, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("mj-api-secret", channel.Key)
+	resp, err := service.GetHttpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get Midjourney tasks status=%d body=%s", resp.StatusCode, string(responseBody))
+	}
+	var responseItems []dto.MidjourneyDto
+	if err := json.Unmarshal(responseBody, &responseItems); err != nil {
+		return nil, fmt.Errorf("decode Midjourney tasks: %w", err)
+	}
+	return responseItems, nil
+}
 
 func UpdateMidjourneyTaskBulk() {
 	//imageModel := "midjourney"
@@ -34,25 +95,21 @@ func UpdateMidjourneyTaskBulk() {
 		logger.LogInfo(ctx, fmt.Sprintf("检测到未完成的任务数有: %v", len(tasks)))
 		taskChannelM := make(map[int][]string)
 		taskM := make(map[string]*model.Midjourney)
-		nullTaskIds := make([]int, 0)
+		nullTasks := make([]*model.Midjourney, 0)
 		for _, task := range tasks {
 			if task.MjId == "" {
 				// 统计失败的未完成任务
-				nullTaskIds = append(nullTaskIds, task.Id)
+				nullTasks = append(nullTasks, task)
 				continue
 			}
 			taskM[task.MjId] = task
 			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], task.MjId)
 		}
-		if len(nullTaskIds) > 0 {
-			err := model.MjBulkUpdateByTaskIds(nullTaskIds, map[string]any{
-				"status":   "FAILURE",
-				"progress": "100%",
-			})
-			if err != nil {
-				logger.LogError(ctx, fmt.Sprintf("Fix null mj_id task error: %v", err))
-			} else {
-				logger.LogInfo(ctx, fmt.Sprintf("Fix null mj_id task success: %v", nullTaskIds))
+		if len(nullTasks) > 0 {
+			for _, task := range nullTasks {
+				if err := failMidjourneyTask(ctx, task, "任务缺少 Midjourney 任务 ID"); err != nil {
+					logger.LogError(ctx, fmt.Sprintf("fail Midjourney task %d without ID: %v", task.Id, err))
+				}
 			}
 		}
 		if len(taskChannelM) == 0 {
@@ -67,59 +124,28 @@ func UpdateMidjourneyTaskBulk() {
 			midjourneyChannel, err := model.CacheGetChannel(channelId)
 			if err != nil {
 				logger.LogError(ctx, fmt.Sprintf("CacheGetChannel: %v", err))
-				err := model.MjBulkUpdate(taskIds, map[string]any{
-					"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
-					"status":      "FAILURE",
-					"progress":    "100%",
-				})
-				if err != nil {
-					logger.LogInfo(ctx, fmt.Sprintf("UpdateMidjourneyTask error: %v", err))
+				reason := fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId)
+				for _, taskID := range taskIds {
+					if task := taskM[taskID]; task != nil {
+						if finalizeErr := failMidjourneyTask(ctx, task, reason); finalizeErr != nil {
+							logger.LogError(ctx, fmt.Sprintf("finalize Midjourney task %s: %v", taskID, finalizeErr))
+						}
+					}
 				}
 				continue
 			}
-			requestUrl := fmt.Sprintf("%s/mj/task/list-by-condition", *midjourneyChannel.BaseURL)
-
-			body, _ := json.Marshal(map[string]any{
-				"ids": taskIds,
-			})
-			req, err := http.NewRequest("POST", requestUrl, bytes.NewBuffer(body))
+			responseItems, err := fetchMidjourneyTasks(ctx, midjourneyChannel, taskIds)
 			if err != nil {
-				logger.LogError(ctx, fmt.Sprintf("Get Task error: %v", err))
+				logger.LogError(ctx, fmt.Sprintf("Get Midjourney tasks error: %v", err))
 				continue
 			}
-			// 设置超时时间
-			timeout := time.Second * 15
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			// 使用带有超时的 context 创建新的请求
-			req = req.WithContext(ctx)
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("mj-api-secret", midjourneyChannel.Key)
-			resp, err := service.GetHttpClient().Do(req)
-			if err != nil {
-				logger.LogError(ctx, fmt.Sprintf("Get Task Do req error: %v", err))
-				continue
-			}
-			if resp.StatusCode != http.StatusOK {
-				logger.LogError(ctx, fmt.Sprintf("Get Task status code: %d", resp.StatusCode))
-				continue
-			}
-			responseBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				logger.LogError(ctx, fmt.Sprintf("Get Mjp Task parse body error: %v", err))
-				continue
-			}
-			var responseItems []dto.MidjourneyDto
-			err = json.Unmarshal(responseBody, &responseItems)
-			if err != nil {
-				logger.LogError(ctx, fmt.Sprintf("Get Mjp Task parse body error2: %v, body: %s", err, string(responseBody)))
-				continue
-			}
-			resp.Body.Close()
-			req.Body.Close()
-			cancel()
 
 			for _, responseItem := range responseItems {
 				task := taskM[responseItem.MjId]
+				if task == nil {
+					logger.LogWarn(ctx, fmt.Sprintf("Midjourney response references unknown task %s", responseItem.MjId))
+					continue
+				}
 
 				useTime := (time.Now().UnixNano() / int64(time.Millisecond)) - task.SubmitTime
 				// 如果时间超过一小时，且进度不是100%，则认为任务失败
@@ -166,44 +192,25 @@ func UpdateMidjourneyTaskBulk() {
 				}
 
 				shouldReturnQuota := false
-				if (task.Progress != "100%" && responseItem.FailReason != "") || (task.Progress == "100%" && task.Status == "FAILURE") {
+				if task.Status == "FAILURE" || responseItem.FailReason != "" {
 					logger.LogInfo(ctx, task.MjId+" 构建失败，"+task.FailReason)
 					task.Progress = "100%"
+					task.Status = "FAILURE"
 					if task.Quota != 0 {
 						shouldReturnQuota = true
 					}
 				}
-				won, err := task.UpdateWithStatus(preStatus)
+				isTerminal := task.Status == "FAILURE" || task.Status == "SUCCESS"
+				var won bool
+				if isTerminal && preStatus != task.Status {
+					won, err = service.FinalizeMidjourneyTransition(ctx, task, preStatus, shouldReturnQuota, task.FailReason)
+				} else {
+					won, err = task.UpdateWithStatus(preStatus)
+				}
 				if err != nil {
 					logger.LogError(ctx, "UpdateMidjourneyTask task error: "+err.Error())
-				} else if won && shouldReturnQuota {
-					mutationID := "midjourney:" + task.MjId + ":refund"
-					if len(mutationID) > 128 {
-						mutationID = "midjourney:" + fmt.Sprintf("%x", common.Sha256Raw([]byte(mutationID)))
-					}
-					applied, mutationErr := model.ApplyUserQuotaMutationWithResult(model.UserQuotaMutation{
-						UserID: task.UserId, DeltaQuota: task.Quota, RequestID: mutationID,
-						SourceType: "midjourney_task", TransactionType: "task_refund",
-						IdempotencyKey: mutationID, Remark: "midjourney task failed",
-					})
-					err = mutationErr
-					if err != nil {
-						logger.LogError(ctx, "fail to increase user quota: "+err.Error())
-					}
-					if applied {
-						model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
-							UserId:    task.UserId,
-							LogType:   model.LogTypeRefund,
-							Content:   "",
-							ChannelId: task.ChannelId,
-							ModelName: service.CovertMjpActionToModelName(task.Action),
-							Quota:     task.Quota,
-							Other: map[string]interface{}{
-								"task_id": task.MjId,
-								"reason":  "构图失败",
-							},
-						})
-					}
+				} else if !won {
+					logger.LogInfo(ctx, fmt.Sprintf("Midjourney task %s already transitioned", task.MjId))
 				}
 			}
 		}

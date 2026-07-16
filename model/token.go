@@ -538,3 +538,23 @@ func InvalidateUserTokensCache(userId int) error {
 	}
 	return firstErr
 }
+
+// InvalidateTokenCacheById removes one token's Redis projection after a
+// transactionally persisted quota mutation. Deletion is safe to retry.
+func InvalidateTokenCacheById(tokenId int) error {
+	if !common.RedisEnabled || tokenId <= 0 {
+		return nil
+	}
+	var token Token
+	err := DB.Unscoped().Select("id", commonKeyCol).Where("id = ?", tokenId).First(&token).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if token.Key == "" {
+		return nil
+	}
+	return cacheDeleteToken(token.Key)
+}

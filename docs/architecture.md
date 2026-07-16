@@ -27,6 +27,7 @@ Hermes Adapter <-------+---- internal chatops/action APIs
 | Community membership and risk controls | new-api | PostgreSQL |
 | Group settings and game policy | new-api | PostgreSQL, exported to Adapter cache |
 | Quiz banks, draws, answers, rewards | new-api | PostgreSQL |
+| Asynchronous task terminal state and billing outbox | new-api | PostgreSQL |
 | Rate-limit and transient cache | new-api | Redis |
 | Adapter game state, learning, leaderboard | Hermes Adapter | `HERMES_STATE_DIR` |
 
@@ -37,6 +38,14 @@ Hermes Adapter <-------+---- internal chatops/action APIs
 3. Risk activation codes are returned to the UI immediately after key creation; controlled keys remain traceable and restorable.
 4. Quiz draw selection locks the bank row and rechecks the active scope after lock acquisition. One user/group scope has one open round.
 5. Adapter config defaults are development-only. Production receives group/game configuration from new-api.
+6. A Task or Midjourney terminal transition and its `task_billing_operations`
+   row commit in one PostgreSQL transaction. Wallet/subscription funding,
+   token totals, aggregate usage, cache invalidation, and logs are replayed as
+   idempotent outbox steps.
+7. Every API node may run the task-billing worker. A fenced lease permits one
+   node to process a row at a time; expired leases and partially completed rows
+   are resumed. A separate `LOG_SQL_DSN` remains supported because billing logs
+   carry a nullable unique idempotency key.
 
 ## Deployment boundary
 

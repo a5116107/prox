@@ -14,6 +14,34 @@ docker system df
 
 Review Nginx status counts, API latency, upstream 429s, Bot action failures, budget pool balance, and risk-control audit events.
 
+## Asynchronous task billing
+
+Task and Midjourney terminal states use the `task_billing_operations` outbox.
+All API replicas run a fenced worker, so do not disable it on secondary nodes.
+Inspect pending age and repeated failures during daily checks:
+
+```sql
+SELECT status, COUNT(*)
+FROM task_billing_operations
+WHERE completed_at = 0
+GROUP BY status;
+
+SELECT id, operation_key, task_kind, task_id, attempt_count,
+       last_error, next_attempt_at, lease_until
+FROM task_billing_operations
+WHERE completed_at = 0
+ORDER BY id
+LIMIT 100;
+```
+
+A short-lived `processing` row is normal. A row whose lease has expired is
+claimed automatically. Investigate durable dependency errors such as exhausted
+wallet/subscription quota or database connectivity before retrying; do not edit
+step flags or apply quota manually. After resolving the dependency, set only
+`next_attempt_at` to `0` when an immediate retry is required. Confirm the row
+reaches `completed`, the task remains terminal, and exactly one funding journal
+and billing log share the operation key.
+
 ## Runtime source verification
 
 Host source and build output are supporting evidence only. Confirm the active

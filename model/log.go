@@ -15,6 +15,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func applyExplicitLogTextFilter(tx *gorm.DB, column string, value string) (*gorm.DB, error) {
@@ -88,38 +89,39 @@ type LogEventOptions struct {
 }
 
 type Log struct {
-	Id                int    `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
-	UserId            int    `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
-	CreatedAt         int64  `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
-	Type              int    `json:"type" gorm:"index:idx_created_at_type"`
-	Content           string `json:"content"`
-	Username          string `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
-	TokenName         string `json:"token_name" gorm:"index;default:''"`
-	ModelName         string `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
-	Quota             int    `json:"quota" gorm:"default:0"`
-	PromptTokens      int    `json:"prompt_tokens" gorm:"default:0"`
-	CompletionTokens  int    `json:"completion_tokens" gorm:"default:0"`
-	UseTime           int    `json:"use_time" gorm:"default:0"`
-	IsStream          bool   `json:"is_stream"`
-	ChannelId         int    `json:"channel" gorm:"index"`
-	ChannelName       string `json:"channel_name" gorm:"->"`
-	TokenId           int    `json:"token_id" gorm:"default:0;index"`
-	Group             string `json:"group" gorm:"index"`
-	Ip                string `json:"ip" gorm:"index;default:''"`
-	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
-	UpstreamRequestId string `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
-	SiteId            string `json:"site_id,omitempty" gorm:"type:varchar(64);index;default:''"`
-	Category          string `json:"category,omitempty" gorm:"type:varchar(64);index;default:''"`
-	Source            string `json:"source,omitempty" gorm:"type:varchar(32);index;default:''"`
-	Action            string `json:"action,omitempty" gorm:"type:varchar(64);index;default:''"`
-	Status            string `json:"status,omitempty" gorm:"type:varchar(32);index;default:''"`
-	RoomId            string `json:"room_id,omitempty" gorm:"type:varchar(128);index;default:''"`
-	ExternalUserId    string `json:"external_user_id,omitempty" gorm:"type:varchar(128);index;default:''"`
-	BudgetPool        string `json:"budget_pool,omitempty" gorm:"type:varchar(64);index;default:''"`
-	RewardType        string `json:"reward_type,omitempty" gorm:"type:varchar(64);index;default:''"`
-	RiskLevel         string `json:"risk_level,omitempty" gorm:"type:varchar(32);index;default:''"`
-	Tags              string `json:"tags,omitempty" gorm:"type:varchar(512);default:''"`
-	Other             string `json:"other"`
+	Id                int     `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
+	UserId            int     `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
+	CreatedAt         int64   `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
+	Type              int     `json:"type" gorm:"index:idx_created_at_type"`
+	Content           string  `json:"content"`
+	Username          string  `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
+	TokenName         string  `json:"token_name" gorm:"index;default:''"`
+	ModelName         string  `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
+	Quota             int     `json:"quota" gorm:"default:0"`
+	PromptTokens      int     `json:"prompt_tokens" gorm:"default:0"`
+	CompletionTokens  int     `json:"completion_tokens" gorm:"default:0"`
+	UseTime           int     `json:"use_time" gorm:"default:0"`
+	IsStream          bool    `json:"is_stream"`
+	ChannelId         int     `json:"channel" gorm:"index"`
+	ChannelName       string  `json:"channel_name" gorm:"->"`
+	TokenId           int     `json:"token_id" gorm:"default:0;index"`
+	Group             string  `json:"group" gorm:"index"`
+	Ip                string  `json:"ip" gorm:"index;default:''"`
+	RequestId         string  `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
+	UpstreamRequestId string  `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
+	SiteId            string  `json:"site_id,omitempty" gorm:"type:varchar(64);index;default:''"`
+	Category          string  `json:"category,omitempty" gorm:"type:varchar(64);index;default:''"`
+	Source            string  `json:"source,omitempty" gorm:"type:varchar(32);index;default:''"`
+	Action            string  `json:"action,omitempty" gorm:"type:varchar(64);index;default:''"`
+	Status            string  `json:"status,omitempty" gorm:"type:varchar(32);index;default:''"`
+	RoomId            string  `json:"room_id,omitempty" gorm:"type:varchar(128);index;default:''"`
+	ExternalUserId    string  `json:"external_user_id,omitempty" gorm:"type:varchar(128);index;default:''"`
+	BudgetPool        string  `json:"budget_pool,omitempty" gorm:"type:varchar(64);index;default:''"`
+	RewardType        string  `json:"reward_type,omitempty" gorm:"type:varchar(64);index;default:''"`
+	RiskLevel         string  `json:"risk_level,omitempty" gorm:"type:varchar(32);index;default:''"`
+	Tags              string  `json:"tags,omitempty" gorm:"type:varchar(512);default:''"`
+	Other             string  `json:"other"`
+	IdempotencyKey    *string `json:"idempotency_key,omitempty" gorm:"type:varchar(128);uniqueIndex"`
 }
 
 // don't use iota, avoid change log type value
@@ -603,6 +605,26 @@ type RecordTaskBillingLogParams struct {
 }
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
+	_, _ = recordTaskBillingLog(params, "")
+}
+
+// RecordTaskBillingLogIdempotent inserts at most one billing log for an outbox operation.
+// A nullable unique key keeps all existing non-outbox log writers unchanged.
+func RecordTaskBillingLogIdempotent(params RecordTaskBillingLogParams, idempotencyKey string) (bool, error) {
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if idempotencyKey == "" {
+		return false, errors.New("task billing log idempotency key is empty")
+	}
+	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
+		return false, nil
+	}
+	return recordTaskBillingLog(params, idempotencyKey)
+}
+
+func recordTaskBillingLog(params RecordTaskBillingLogParams, idempotencyKey string) (bool, error) {
+	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
+		return false, nil
+	}
 	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
 	if params.TokenId > 0 {
@@ -610,7 +632,7 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 			tokenName = token.Name
 		}
 	}
-	RecordLogEvent(params.UserId, params.LogType, params.Content, LogEventOptions{
+	logEntry := buildLogEntry(params.UserId, params.LogType, params.Content, LogEventOptions{
 		Username:  username,
 		TokenName: tokenName,
 		ModelName: params.ModelName,
@@ -624,6 +646,23 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		Status:    "success",
 		Other:     params.Other,
 	})
+	if idempotencyKey == "" {
+		if err := LOG_DB.Create(logEntry).Error; err != nil {
+			common.SysLog("failed to record task billing log: " + err.Error())
+			return false, err
+		}
+		return true, nil
+	}
+	key := idempotencyKey
+	logEntry.IdempotencyKey = &key
+	result := LOG_DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "idempotency_key"}},
+		DoNothing: true,
+	}).Create(logEntry)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 func GetAllLogs(filter LogQueryFilter) (logs []*Log, total int64, err error) {

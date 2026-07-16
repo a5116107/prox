@@ -57,6 +57,26 @@ sends the generated URL as a fallback so the result is not lost.
 
 Check that the bank has published questions, the bank itself is published, and an exact or wildcard binding matches site/platform/group. Then inspect `/api/ops/quiz/<site>/stats`. The Adapter no longer falls back to a hard-coded question list.
 
+## Task is terminal but billing is pending
+
+Find the row by the public task ID or operation key:
+
+```sql
+SELECT operation_key, status, attempt_count, last_error,
+       funding_applied, token_applied, token_cache_invalidated,
+       usage_applied, log_applied, lease_until, next_attempt_at
+FROM task_billing_operations
+WHERE task_id = 'TASK_ID'
+ORDER BY id DESC;
+```
+
+The terminal task and outbox row commit together. A missing row therefore
+indicates an old image or a terminal write path outside the finalizer; verify
+the active image before changing data. For an existing row, resolve
+`last_error` and let the worker replay it. Funding journals and billing logs are
+idempotent, so restarting the application is sufficient after a transient
+database or log-database outage.
+
 ## Release failed
 
 `release.sh` restores the prior image automatically after a failed switch. Inspect:

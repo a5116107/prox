@@ -117,3 +117,13 @@ go test ./service -run '^TestQuizDrawConcurrentPostgres$' -count=1
 ```
 
 The test creates and removes an isolated PostgreSQL schema.
+
+Asynchronous task billing tests use `TEST_POSTGRES_DSN` and exercise the same
+outbox, lease, transaction, and nullable log-idempotency index used in
+production:
+
+```bash
+export TEST_POSTGRES_DSN='host=127.0.0.1 port=5432 user=prox_test password=prox_test dbname=prox_test sslmode=disable'
+go test ./service -run 'Test(TaskBillingOperation|FinalizeTaskTransition|FinalizeMidjourneyTransition)' -count=1
+go test -race ./model ./service -run 'Test(TaskBillingOperation|FinalizeTaskTransition|TransitionTaskWithBillingOperation)' -count=1
+```
