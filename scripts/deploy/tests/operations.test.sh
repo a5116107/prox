@@ -79,6 +79,8 @@ declare -F verify_backup_checksums >/dev/null \
   || fail "strict checksum verification helper is missing"
 declare -F write_restore_state >/dev/null \
   || fail "restore drill state writer is missing"
+grep -Fq 'docker rm -fv "$DRILL_CONTAINER"' "$DEPLOY_DIR/restore-drill.sh" \
+  || fail "restore drill cleanup leaves anonymous PostgreSQL volumes behind"
 
 archive_fixture="$(mktemp -d)"
 trap 'rm -rf -- "$archive_fixture"; [[ -z "${RESULTS_FILE:-}" ]] || rm -f -- "$RESULTS_FILE"' EXIT

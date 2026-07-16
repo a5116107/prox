@@ -10,7 +10,7 @@ DRILL_CONTAINER=""
 
 cleanup_restore_drill() {
   if [[ -n "$DRILL_CONTAINER" ]]; then
-    docker rm -f "$DRILL_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -fv "$DRILL_CONTAINER" >/dev/null 2>&1 || true
   fi
   [[ -z "$DRILL_DIR" ]] || rm -rf -- "$DRILL_DIR"
 }
