@@ -44,6 +44,7 @@ skills-lock.json
 # Local runtime state and generated evidence
 .context-snapshots/
 .skills-pack/
+docs/specs/WORKFLOW_STACK.json
 .pytest_cache/
 __pycache__/
 *.py[cod]
