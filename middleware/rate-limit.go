@@ -2,103 +2,250 @@ package middleware
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 )
 
-var timeFormat = "2006-01-02T15:04:05.000Z"
+const timeFormat = "2006-01-02T15:04:05.000Z"
 
 var inMemoryRateLimiter common.InMemoryRateLimiter
+
+var redisSlidingWindowRateLimitScript = redis.NewScript(`
+local key = KEYS[1]
+local maximum = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local now_parts = redis.call('TIME')
+local now = tonumber(now_parts[1]) + tonumber(now_parts[2]) / 1000000
+local cutoff = now - window
+
+while true do
+    local oldest = redis.call('LINDEX', key, -1)
+    if not oldest or tonumber(oldest) > cutoff then
+        break
+    end
+    redis.call('RPOP', key)
+end
+
+if redis.call('LLEN', key) >= maximum then
+    redis.call('EXPIRE', key, math.max(window, 1))
+    return 0
+end
+
+redis.call('LPUSH', key, tostring(now))
+redis.call('EXPIRE', key, math.max(window, 1))
+return 1
+`)
+
+var (
+	rateLimitRedisErrorLogMu sync.Mutex
+	rateLimitRedisErrorAt    time.Time
+)
 
 var defNext = func(c *gin.Context) {
 	c.Next()
 }
 
-func redisRateLimiter(c *gin.Context, maxRequestNum int, duration int64, mark string) {
-	ctx := context.Background()
-	rdb := common.RDB
-	key := "rateLimit:" + mark + c.ClientIP()
-	listLength, err := rdb.LLen(ctx, key).Result()
+func redisRateLimiter(ctx context.Context, key string, maxRequestNum int, duration int64) (bool, error) {
+	if common.RDB == nil {
+		return false, fmt.Errorf("redis rate limiter is enabled without a redis client")
+	}
+	result, err := redisSlidingWindowRateLimitScript.Run(
+		ctx,
+		common.RDB,
+		[]string{key},
+		maxRequestNum,
+		duration,
+	).Int()
 	if err != nil {
-		fmt.Println(err.Error())
-		c.Status(http.StatusInternalServerError)
-		c.Abort()
-		return
+		return false, err
 	}
-	if listLength < int64(maxRequestNum) {
-		rdb.LPush(ctx, key, time.Now().Format(timeFormat))
-		rdb.Expire(ctx, key, common.RateLimitKeyExpirationDuration)
-	} else {
-		oldTimeStr, _ := rdb.LIndex(ctx, key, -1).Result()
-		oldTime, err := time.Parse(timeFormat, oldTimeStr)
-		if err != nil {
-			fmt.Println(err)
-			c.Status(http.StatusInternalServerError)
-			c.Abort()
-			return
-		}
-		nowTimeStr := time.Now().Format(timeFormat)
-		nowTime, err := time.Parse(timeFormat, nowTimeStr)
-		if err != nil {
-			fmt.Println(err)
-			c.Status(http.StatusInternalServerError)
-			c.Abort()
-			return
-		}
-		// time.Since will return negative number!
-		// See: https://stackoverflow.com/questions/50970900/why-is-time-since-returning-negative-durations-on-windows
-		if int64(nowTime.Sub(oldTime).Seconds()) < duration {
-			rdb.Expire(ctx, key, common.RateLimitKeyExpirationDuration)
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
-			return
-		} else {
-			rdb.LPush(ctx, key, time.Now().Format(timeFormat))
-			rdb.LTrim(ctx, key, 0, int64(maxRequestNum-1))
-			rdb.Expire(ctx, key, common.RateLimitKeyExpirationDuration)
-		}
-	}
+	return result == 1, nil
 }
 
-func memoryRateLimiter(c *gin.Context, maxRequestNum int, duration int64, mark string) {
-	key := mark + c.ClientIP()
-	if !inMemoryRateLimiter.Request(key, maxRequestNum, duration) {
-		c.Status(http.StatusTooManyRequests)
-		c.Abort()
+func logRateLimitRedisFallback(err error) {
+	rateLimitRedisErrorLogMu.Lock()
+	defer rateLimitRedisErrorLogMu.Unlock()
+	if time.Since(rateLimitRedisErrorAt) < time.Minute {
 		return
+	}
+	rateLimitRedisErrorAt = time.Now()
+	common.SysError("redis rate limiter failed; using the per-node memory limiter: " + err.Error())
+}
+
+func allowRateLimitRequest(c *gin.Context, key string, maxRequestNum int, duration int64) bool {
+	if maxRequestNum <= 0 {
+		return false
+	}
+	if duration <= 0 {
+		duration = 1
+	}
+	if common.RedisEnabled {
+		allowed, err := redisRateLimiter(c.Request.Context(), key, maxRequestNum, duration)
+		if err == nil {
+			return allowed
+		}
+		logRateLimitRedisFallback(err)
+	}
+	inMemoryRateLimiter.Init(common.RateLimitKeyExpirationDuration)
+	return inMemoryRateLimiter.Request("fallback:"+key, maxRequestNum, duration)
+}
+
+func rejectRateLimitedRequest(c *gin.Context, duration int64, scope string) {
+	if duration <= 0 {
+		duration = 1
+	}
+	c.Header("Retry-After", strconv.FormatInt(duration, 10))
+	c.Header("X-RateLimit-Scope", scope)
+	c.Status(http.StatusTooManyRequests)
+	c.Abort()
+}
+
+type rateLimitIdentityFunc func(c *gin.Context) string
+
+func rateLimitFactoryWithIdentity(maxRequestNum int, duration int64, mark string, identityFn rateLimitIdentityFunc) func(c *gin.Context) {
+	return func(c *gin.Context) {
+		identity := identityFn(c)
+		key := "rateLimit:" + mark + ":" + identity
+		if !allowRateLimitRequest(c, key, maxRequestNum, duration) {
+			rejectRateLimitedRequest(c, duration, mark)
+		}
 	}
 }
 
 func rateLimitFactory(maxRequestNum int, duration int64, mark string) func(c *gin.Context) {
-	if common.RedisEnabled {
-		return func(c *gin.Context) {
-			redisRateLimiter(c, maxRequestNum, duration, mark)
+	return rateLimitFactoryWithIdentity(maxRequestNum, duration, mark, ipRateLimitIdentity)
+}
+
+func ipRateLimitIdentity(c *gin.Context) string {
+	clientIP := strings.TrimSpace(c.ClientIP())
+	if clientIP == "" {
+		clientIP = "unknown"
+	}
+	return "ip:" + clientIP
+}
+
+func sessionRateLimitIdentity(c *gin.Context) (identity string) {
+	defer func() {
+		if recover() != nil {
+			identity = ""
 		}
-	} else {
-		// It's safe to call multi times.
-		inMemoryRateLimiter.Init(common.RateLimitKeyExpirationDuration)
-		return func(c *gin.Context) {
-			memoryRateLimiter(c, maxRequestNum, duration, mark)
+	}()
+	session := sessions.Default(c)
+	switch id := session.Get("id").(type) {
+	case int:
+		if id > 0 {
+			return fmt.Sprintf("user:%d", id)
 		}
+	case int64:
+		if id > 0 {
+			return fmt.Sprintf("user:%d", id)
+		}
+	case uint:
+		if id > 0 {
+			return fmt.Sprintf("user:%d", id)
+		}
+	}
+	return ""
+}
+
+func credentialRateLimitIdentity(c *gin.Context) string {
+	for _, header := range []string{
+		"Authorization",
+		"X-Api-Key",
+		"X-Hermes-Key",
+		"X-Telegram-Bot-Api-Secret-Token",
+		"Access-Token",
+	} {
+		value := strings.TrimSpace(c.GetHeader(header))
+		if value == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(header + ":" + value))
+		return fmt.Sprintf("credential:%x", digest[:12])
+	}
+	return ""
+}
+
+func webRateLimitIdentity(c *gin.Context) string {
+	if identity := sessionRateLimitIdentity(c); identity != "" {
+		return identity
+	}
+	return ipRateLimitIdentity(c)
+}
+
+func apiRateLimitIdentity(c *gin.Context) string {
+	if identity := sessionRateLimitIdentity(c); identity != "" {
+		return identity
+	}
+	if identity := credentialRateLimitIdentity(c); identity != "" {
+		return identity
+	}
+	return ipRateLimitIdentity(c)
+}
+
+func isStaticAssetRequest(c *gin.Context) bool {
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		return false
+	}
+	requestPath := strings.ToLower(c.Request.URL.Path)
+	for _, prefix := range []string{"/static/", "/assets/", "/fonts/"} {
+		if strings.HasPrefix(requestPath, prefix) {
+			return true
+		}
+	}
+	switch requestPath {
+	case "/favicon.ico", "/logo.png", "/manifest.json", "/site.webmanifest", "/robots.txt", "/service-worker.js", "/sw.js":
+		return true
+	}
+	switch path.Ext(requestPath) {
+	case ".avif", ".css", ".eot", ".gif", ".ico", ".jpeg", ".jpg", ".js", ".map", ".png", ".svg", ".ttf", ".webp", ".woff", ".woff2":
+		return true
+	default:
+		return false
 	}
 }
 
 func GlobalWebRateLimit() func(c *gin.Context) {
-	if common.GlobalWebRateLimitEnable {
-		return rateLimitFactory(common.GlobalWebRateLimitNum, common.GlobalWebRateLimitDuration, "GW")
+	if !common.GlobalWebRateLimitEnable {
+		return defNext
 	}
-	return defNext
+	limiter := rateLimitFactoryWithIdentity(common.GlobalWebRateLimitNum, common.GlobalWebRateLimitDuration, "GW", webRateLimitIdentity)
+	return func(c *gin.Context) {
+		if isStaticAssetRequest(c) {
+			return
+		}
+		limiter(c)
+	}
 }
 
 func GlobalAPIRateLimit() func(c *gin.Context) {
-	if common.GlobalApiRateLimitEnable {
-		return rateLimitFactory(common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, "GA")
+	if !common.GlobalApiRateLimitEnable {
+		return defNext
 	}
-	return defNext
+	identityLimiter := rateLimitFactoryWithIdentity(common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, "GA", apiRateLimitIdentity)
+	ipUmbrellaLimit := common.GlobalApiRateLimitNum * 4
+	if ipUmbrellaLimit < common.GlobalApiRateLimitNum {
+		ipUmbrellaLimit = common.GlobalApiRateLimitNum
+	}
+	ipUmbrellaLimiter := rateLimitFactoryWithIdentity(ipUmbrellaLimit, common.GlobalApiRateLimitDuration, "GAI", ipRateLimitIdentity)
+	return func(c *gin.Context) {
+		identityLimiter(c)
+		if c.IsAborted() {
+			return
+		}
+		ipUmbrellaLimiter(c)
+	}
 }
 
 func CriticalRateLimit() func(c *gin.Context) {
@@ -120,20 +267,6 @@ func UploadRateLimit() func(c *gin.Context) {
 // instead of client IP, making it resistant to proxy rotation attacks.
 // Must be used AFTER authentication middleware (UserAuth).
 func userRateLimitFactory(maxRequestNum int, duration int64, mark string) func(c *gin.Context) {
-	if common.RedisEnabled {
-		return func(c *gin.Context) {
-			userId := c.GetInt("id")
-			if userId == 0 {
-				c.Status(http.StatusUnauthorized)
-				c.Abort()
-				return
-			}
-			key := fmt.Sprintf("rateLimit:%s:user:%d", mark, userId)
-			userRedisRateLimiter(c, maxRequestNum, duration, key)
-		}
-	}
-	// It's safe to call multi times.
-	inMemoryRateLimiter.Init(common.RateLimitKeyExpirationDuration)
 	return func(c *gin.Context) {
 		userId := c.GetInt("id")
 		if userId == 0 {
@@ -141,56 +274,9 @@ func userRateLimitFactory(maxRequestNum int, duration int64, mark string) func(c
 			c.Abort()
 			return
 		}
-		key := fmt.Sprintf("%s:user:%d", mark, userId)
-		if !inMemoryRateLimiter.Request(key, maxRequestNum, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
-			return
-		}
-	}
-}
-
-// userRedisRateLimiter is like redisRateLimiter but accepts a pre-built key
-// (to support user-ID-based keys).
-func userRedisRateLimiter(c *gin.Context, maxRequestNum int, duration int64, key string) {
-	ctx := context.Background()
-	rdb := common.RDB
-	listLength, err := rdb.LLen(ctx, key).Result()
-	if err != nil {
-		fmt.Println(err.Error())
-		c.Status(http.StatusInternalServerError)
-		c.Abort()
-		return
-	}
-	if listLength < int64(maxRequestNum) {
-		rdb.LPush(ctx, key, time.Now().Format(timeFormat))
-		rdb.Expire(ctx, key, common.RateLimitKeyExpirationDuration)
-	} else {
-		oldTimeStr, _ := rdb.LIndex(ctx, key, -1).Result()
-		oldTime, err := time.Parse(timeFormat, oldTimeStr)
-		if err != nil {
-			fmt.Println(err)
-			c.Status(http.StatusInternalServerError)
-			c.Abort()
-			return
-		}
-		nowTimeStr := time.Now().Format(timeFormat)
-		nowTime, err := time.Parse(timeFormat, nowTimeStr)
-		if err != nil {
-			fmt.Println(err)
-			c.Status(http.StatusInternalServerError)
-			c.Abort()
-			return
-		}
-		if int64(nowTime.Sub(oldTime).Seconds()) < duration {
-			rdb.Expire(ctx, key, common.RateLimitKeyExpirationDuration)
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
-			return
-		} else {
-			rdb.LPush(ctx, key, time.Now().Format(timeFormat))
-			rdb.LTrim(ctx, key, 0, int64(maxRequestNum-1))
-			rdb.Expire(ctx, key, common.RateLimitKeyExpirationDuration)
+		key := fmt.Sprintf("rateLimit:%s:user:%d", mark, userId)
+		if !allowRateLimitRequest(c, key, maxRequestNum, duration) {
+			rejectRateLimitedRequest(c, duration, mark)
 		}
 	}
 }

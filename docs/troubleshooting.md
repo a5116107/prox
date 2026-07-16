@@ -9,7 +9,7 @@ curl -fsS http://127.0.0.1:3000/release-marker.txt
 docker logs --tail 200 new-api-proxy
 ```
 
-A host-side frontend build is not live. Rebuild/switch the application image. Static assets must be excluded from API rate limiting at the proxy/application policy; a static 429 is local configuration, not an upstream model limit.
+A host-side frontend build is not live. Rebuild/switch the application image. The application excludes GET/HEAD static assets (`/static/`, `/assets/`, `/fonts/`, favicon, logo, scripts, styles, images, and fonts) from the page-navigation limiter. A static 429 therefore points to an outer reverse proxy/CDN rule or an image older than the R4 limiter fix, not an upstream model limit. The API limiter uses a signed session user or credential bucket first and a separate four-times-larger IP umbrella; inspect `X-RateLimit-Scope` and `Retry-After` on a 429 response to identify the bucket.
 
 ## API route returns 404
 
