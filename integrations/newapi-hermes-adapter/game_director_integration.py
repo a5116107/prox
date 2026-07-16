@@ -3,7 +3,11 @@
 import os, sys, time, threading
 from collections import defaultdict
 
-PD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_plugins")
+ADAPTER_ROOT = os.path.dirname(os.path.abspath(__file__))
+PD = os.path.join(ADAPTER_ROOT, "game_plugins")
+GAME_CONFIG_PATH = os.environ.get("HERMES_GAME_CONFIG_CACHE") or os.path.join(
+    ADAPTER_ROOT, "game_config.json"
+)
 if PD not in sys.path:
     sys.path.insert(0, os.path.dirname(PD))
 from game_plugins.base import GameDirector, GameContext, GameResponse
@@ -58,7 +62,7 @@ class GameDirectorIntegration:
         try:
             import json as _j
 
-            with open("/opt/newapi-hermes-adapter/game_config.json") as _f:
+            with open(GAME_CONFIG_PATH, encoding="utf-8") as _f:
                 return _j.load(_f).get("system", {})
         except Exception:
             return {}

@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=prox
 Group=prox
+SupplementaryGroups=systemd-journal
 WorkingDirectory=/opt/prox/current/integrations/newapi-hermes-adapter
 EnvironmentFile=/etc/prox/hermes.env
 Environment=PYTHONUNBUFFERED=1
@@ -15,6 +16,7 @@ Environment=HERMES_STATE_DIR=/var/lib/prox-hermes
 Environment=HERMES_GAME_CONFIG_CACHE=/var/lib/prox-hermes/game_config.json
 Environment=HERMES_LEARNING_STORE=/var/lib/prox-hermes/learning_store.json
 Environment=HERMES_LEADERBOARD_STORE=/var/lib/prox-hermes/leaderboard_stats.json
+Environment=HERMES_ADAPTER_SYSTEMD_UNIT=prox-hermes-adapter.service
 ExecStart=/opt/prox/venv/bin/python adapter.py
 Restart=always
 RestartSec=3

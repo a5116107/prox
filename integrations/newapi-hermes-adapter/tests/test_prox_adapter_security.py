@@ -39,6 +39,7 @@ _ISOLATED_ENV_KEYS = (
     "CHATOPS_ADMIN_TG_IDS",
     "HERMES_ADAPTER_LOG",
     "HERMES_BURN_QUEUE_CAPACITY",
+    "HERMES_GAME_CONFIG_CACHE",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
     "IMAGE_API_BASE_URL",
@@ -221,6 +222,23 @@ def test_internal_chatops_secret_is_sent_in_headers_not_url(adapter_loader):
     assert headers["Authorization"] == "Bearer internal-secret"
     assert tg_headers["Authorization"] == "Bearer internal-secret"
     assert tg_headers["X-Telegram-Bot-Api-Secret-Token"] == "internal-secret"
+
+
+def test_system_config_uses_configured_state_path(adapter_loader, tmp_path):
+    config_path = tmp_path / "runtime" / "game_config.json"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        json.dumps({"system": {"group_risk_enabled": False, "burn_after_seconds": 9}}),
+        encoding="utf-8",
+    )
+
+    adapter = adapter_loader(HERMES_GAME_CONFIG_CACHE=str(config_path))
+
+    assert adapter.GAME_CONFIG_PATH == str(config_path)
+    assert adapter._load_system_config() == {
+        "group_risk_enabled": False,
+        "burn_after_seconds": 9,
+    }
 
 
 def test_planner_recomputes_admin_and_allows_only_self_quota(

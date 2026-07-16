@@ -59,6 +59,9 @@ ADAPTER_KEY = os.environ.get("GAME_ADMIN_KEY") or os.environ.get(
 COMMUNITY_ROOM_ID = os.environ.get("COMMUNITY_ROOM_ID", "")
 BOT_PLATFORM = os.environ.get("BOT_PLATFORM", "")
 LOG_PATH = os.environ.get("HERMES_ADAPTER_LOG", "/var/log/newapi-hermes-adapter.log")
+GAME_CONFIG_PATH = os.environ.get("HERMES_GAME_CONFIG_CACHE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "game_config.json"
+)
 TIMEOUT = float(os.environ.get("HERMES_TIMEOUT", "45"))
 GROUP_MODEL_TIMEOUT = min(TIMEOUT, float(os.environ.get("HERMES_GROUP_TIMEOUT", "18")))
 GROUP_MODEL_RETRIES = max(1, int(os.environ.get("HERMES_GROUP_RETRIES", "1")))
@@ -3161,7 +3164,7 @@ def _action_user_summaries(actions, results):
 # ===== 群消息风控：规则粗筛 + LLM 复核，确认违规则撤回+提醒（群主/管理员豁免）=====
 def _load_system_config():
     try:
-        with open("/opt/newapi-hermes-adapter/game_config.json") as _f:
+        with open(GAME_CONFIG_PATH, encoding="utf-8") as _f:
             return json.load(_f).get("system", {})
     except Exception:
         return {}
