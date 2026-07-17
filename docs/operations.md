@@ -1,5 +1,9 @@
 # Operations
 
+MM Portal and AWX use a separate operations-plane lifecycle. See
+[MM Portal And AWX Operations](mm-awx-operations.md) for topology, health
+checks, backup validation, rollback, and K3s disk-retention boundaries.
+
 ## Daily checks
 
 ```bash
