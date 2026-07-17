@@ -347,19 +347,54 @@ proxy_mount_source() {
     | awk -F '\t' -v destination="$destination" '$1 == destination {print $2; exit}'
 }
 
+proxy_network_gateway() {
+  local upstream="${1:-new-api}" upstream_networks network candidate_gateway gateway="" octet
+  local -a octets
+  upstream_networks="$(
+    docker inspect --format \
+      '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+      "$upstream" 2>/dev/null
+  )"
+  while IFS=$'\t' read -r network candidate_gateway; do
+    if [[ -n "$network" && -n "$candidate_gateway" ]] \
+      && grep -Fxq "$network" <<<"$upstream_networks"; then
+      gateway="$candidate_gateway"
+      break
+    fi
+  done < <(
+    docker inspect --format \
+      '{{range $name, $network := .NetworkSettings.Networks}}{{printf "%s\t%s\n" $name $network.Gateway}}{{end}}' \
+      "$NEWAPI_PROXY_CONTAINER" 2>/dev/null
+  )
+  IFS='.' read -r -a octets <<<"$gateway"
+  if (( ${#octets[@]} != 4 )); then
+    log "proxy and New API upstream do not share an IPv4 network gateway: $upstream" >&2
+    return 1
+  fi
+  for octet in "${octets[@]}"; do
+    if [[ ! "$octet" =~ ^[0-9]+$ ]] || (( 10#$octet > 255 )); then
+      log "proxy network returned an invalid IPv4 gateway: $gateway" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$gateway"
+}
+
 render_proxy_runtime_site() {
-  local output="$1" upstream="${2:-new-api}"
+  local output="$1" upstream="${2:-new-api}" adapter_gateway
   if [[ "$upstream" != "new-api" ]] && ! valid_newapi_container_name "$upstream"; then
     log "invalid New API proxy upstream: $upstream" >&2
     return 1
   fi
-  awk -v upstream="$upstream" '
+  adapter_gateway="$(proxy_network_gateway "$upstream")" || return 1
+  awk -v upstream="$upstream" -v adapter_gateway="$adapter_gateway" '
     {
       line = $0
-      replacements += gsub(/server new-api:3000 resolve;/, "server " upstream ":3000 resolve;", line)
+      upstream_replacements += gsub(/server new-api:3000 resolve;/, "server " upstream ":3000 resolve;", line)
+      adapter_replacements += gsub(/proxy_pass http:\/\/host[.]docker[.]internal:18181;/, "proxy_pass http://" adapter_gateway ":18181;", line)
       print line
     }
-    END { if (replacements != 1) exit 42 }
+    END { if (upstream_replacements != 1 || adapter_replacements < 1) exit 42 }
   ' "$REPO_ROOT/proxy/nginx.conf" >"$output"
 }
 

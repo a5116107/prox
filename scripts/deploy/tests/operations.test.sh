@@ -113,14 +113,48 @@ grep -Fq 'render_proxy_runtime_site' "$DEPLOY_DIR/_lib.sh" \
 grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
   || fail "Compose traffic service can start scheduled master jobs"
 (
+  docker() {
+    [[ "$1" == "inspect" ]] || fail "unexpected Docker call while resolving the proxy gateway: $*"
+    case "${*: -1}" in
+      new-api-candidate) printf '%s\n' new-api-dev_new-api-network ;;
+      new-api-proxy)
+        printf 'bridge\t172.17.0.1\nnew-api-dev_new-api-network\t172.19.0.1\n'
+        ;;
+      *) fail "unexpected container while resolving the proxy gateway: ${*: -1}" ;;
+    esac
+  }
+  assert_equal 172.19.0.1 "$(proxy_network_gateway new-api-candidate)" \
+    "proxy network gateway"
+)
+(
+  docker() {
+    case "${*: -1}" in
+      new-api-candidate) printf '%s\n' new-api-dev_new-api-network ;;
+      new-api-proxy) printf 'new-api-dev_new-api-network\t172.19.0.999\n' ;;
+    esac
+  }
+  assert_failure "invalid proxy network gateway accepted" \
+    proxy_network_gateway new-api-candidate
+)
+(
   rendered_proxy="$(mktemp)"
   trap 'rm -f -- "$rendered_proxy"' EXIT
+  proxy_network_gateway() {
+    [[ "$1" == "new-api" || "$1" == "new-api-candidate" ]] \
+      || fail "unexpected upstream while rendering the proxy: $1"
+    printf '%s\n' 172.19.0.1
+  }
   render_proxy_runtime_site "$rendered_proxy"
-  cmp -s "$REPO_ROOT/proxy/nginx.conf" "$rendered_proxy" \
-    || fail "runtime proxy rendering rewrites the tracked source configuration"
+  assert_equal 3 "$(grep -Fc 'proxy_pass http://172.19.0.1:18181;' "$rendered_proxy")" \
+    "runtime Adapter gateway replacement count"
+  if grep -Fq 'host.docker.internal:18181' "$rendered_proxy"; then
+    fail "runtime proxy rendering retained an unresolved Adapter hostname"
+  fi
   render_proxy_runtime_site "$rendered_proxy" new-api-candidate
   grep -Fq 'server new-api-candidate:3000 resolve;' "$rendered_proxy" \
     || fail "runtime proxy does not target the verified candidate by name"
+  assert_equal 3 "$(grep -Fc 'proxy_pass http://172.19.0.1:18181;' "$rendered_proxy")" \
+    "candidate Adapter gateway replacement count"
   if grep -Fq 'server new-api:3000 resolve;' "$rendered_proxy"; then
     fail "candidate proxy rendering still targets the shared service alias"
   fi
