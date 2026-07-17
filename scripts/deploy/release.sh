@@ -29,7 +29,8 @@ rollback_on_error() {
   trap - ERR
   if (( switched == 1 )); then
     log "release failed; restoring ${PREVIOUS_CONTAINER:-the pre-release state}"
-    restore_previous_newapi "$PREVIOUS_CONTAINER" "$CANDIDATE_CONTAINER"
+    restore_previous_newapi "$PREVIOUS_CONTAINER" "$CANDIDATE_CONTAINER" "$PREVIOUS_IMAGE" \
+      || log "automatic traffic rollback needs operator cleanup"
     restore_previous_newapi_worker "$PREVIOUS_WORKER_CONTAINER" "$WORKER_CONTAINER"
     if [[ -n "$PREVIOUS_IMAGE" ]]; then
       set_env_value "$ENV_FILE" NEWAPI_IMAGE "$PREVIOUS_IMAGE" || true
@@ -39,8 +40,6 @@ rollback_on_error() {
   exit "$status"
 }
 trap rollback_on_error ERR
-
-sync_proxy_runtime_config
 
 log "building $NEW_IMAGE"
 docker build --pull \

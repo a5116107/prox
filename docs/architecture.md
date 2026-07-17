@@ -50,7 +50,7 @@ The active New API traffic container owns request processing and authorization. 
 
 ## Deployment boundary
 
-The Docker image is the release unit for backend and frontend. Releases start a uniquely named slave candidate, verify it before traffic, add it to the stable `new-api` Docker alias, gracefully drain the previous traffic container, and then replace the single master worker. `compose.prod.yml` mounts only data and logs into application containers. Hermes runs as a separate systemd service with state under `/var/lib/prox-hermes` and is reached from Docker through `host.docker.internal`.
+The Docker image is the release unit for backend and frontend. Releases start a uniquely named slave candidate and verify it before traffic. The release transaction renders that exact container name into the bind-mounted Nginx upstream and hot reloads Nginx. Retired Nginx workers keep their existing streams on the previous container; the previous container is stopped only after those workers exit. The release then replaces the single master worker. `compose.prod.yml` mounts only data and logs into application containers. Hermes runs as a separate systemd service with state under `/var/lib/prox-hermes` and is reached from Docker through `host.docker.internal`.
 
 ## Scale path
 

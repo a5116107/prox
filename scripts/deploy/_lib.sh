@@ -11,6 +11,7 @@ NEWAPI_CONTAINER="${NEWAPI_CONTAINER:-new-api}"
 NEWAPI_PROXY_CONTAINER="${NEWAPI_PROXY_CONTAINER:-new-api-proxy}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 HERMES_ADAPTER_ENV_FILE="${HERMES_ADAPTER_ENV_FILE:-/etc/prox/hermes.env}"
+PROXY_RETIRED_WORKER_PIDS=""
 
 log() {
   printf '[prox-deploy] %s\n' "$*"
@@ -347,12 +348,55 @@ proxy_mount_source() {
 }
 
 render_proxy_runtime_site() {
-  local output="$1"
-  cp -- "$REPO_ROOT/proxy/nginx.conf" "$output"
+  local output="$1" upstream="${2:-new-api}"
+  if [[ "$upstream" != "new-api" ]] && ! valid_newapi_container_name "$upstream"; then
+    log "invalid New API proxy upstream: $upstream" >&2
+    return 1
+  fi
+  awk -v upstream="$upstream" '
+    {
+      line = $0
+      replacements += gsub(/server new-api:3000 resolve;/, "server " upstream ":3000 resolve;", line)
+      print line
+    }
+    END { if (replacements != 1) exit 42 }
+  ' "$REPO_ROOT/proxy/nginx.conf" >"$output"
+}
+
+proxy_worker_pids() {
+  docker top "$NEWAPI_PROXY_CONTAINER" -eo pid,args 2>/dev/null \
+    | awk 'NR > 1 && /nginx: worker process/ {print $1}'
+}
+
+wait_for_proxy_workers_to_exit() {
+  local retired_pids="${1:-}" timeout_seconds="${2:-${NEWAPI_PROXY_DRAIN_TIMEOUT_SECONDS:-900}}"
+  local deadline current_pids pid pending
+  [[ -n "$retired_pids" ]] || return 0
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || {
+    log "NEWAPI_PROXY_DRAIN_TIMEOUT_SECONDS must be numeric" >&2
+    return 1
+  }
+  deadline="$(( $(date +%s) + timeout_seconds ))"
+  while (( $(date +%s) <= deadline )); do
+    current_pids="$(proxy_worker_pids || true)"
+    pending=0
+    for pid in $retired_pids; do
+      if grep -qx "$pid" <<<"$current_pids"; then
+        pending=1
+        break
+      fi
+    done
+    (( pending == 1 )) || return 0
+    sleep 1
+  done
+  log "Nginx workers did not drain within ${timeout_seconds}s: $retired_pids" >&2
+  return 1
 }
 
 sync_proxy_runtime_config() {
-  local runtime_main runtime_site backup_dir rendered_site status=0 body=""
+  local upstream="${1:-new-api}"
+  local runtime_main runtime_site backup_dir rendered_site status=0 body="" changed=0
+  local retired_worker_pids="" rollback_worker_pids="" reload_succeeded=0 rollback_succeeded=0
   runtime_main="$(proxy_mount_source /etc/nginx/nginx.conf)"
   runtime_site="$(proxy_mount_source /etc/nginx/conf.d/default.conf)"
   [[ -f "$runtime_main" && -f "$runtime_site" ]] || {
@@ -363,13 +407,15 @@ sync_proxy_runtime_config() {
   cp -- "$runtime_main" "$backup_dir/nginx-main.conf"
   cp -- "$runtime_site" "$backup_dir/nginx.conf"
   rendered_site="$backup_dir/nginx.rendered.conf"
-  render_proxy_runtime_site "$rendered_site" || status=1
+  render_proxy_runtime_site "$rendered_site" "$upstream" || status=1
 
   if ! cmp -s "$REPO_ROOT/proxy/nginx-main.conf" "$runtime_main"; then
     cat "$REPO_ROOT/proxy/nginx-main.conf" >"$runtime_main" || status=1
+    changed=1
   fi
   if (( status == 0 )) && ! cmp -s "$rendered_site" "$runtime_site"; then
     cat "$rendered_site" >"$runtime_site" || status=1
+    changed=1
   fi
   if (( status == 0 )); then
     docker exec "$NEWAPI_PROXY_CONTAINER" nginx -t >/dev/null 2>&1 || status=1
@@ -382,26 +428,54 @@ sync_proxy_runtime_config() {
     log "proxy configuration validation failed; previous files restored" >&2
     return 1
   fi
-  docker exec "$NEWAPI_PROXY_CONTAINER" nginx -s reload >/dev/null || status=1
-  sleep 1
+  if (( changed == 1 )); then
+    retired_worker_pids="$(proxy_worker_pids || true)"
+    retired_worker_pids="${retired_worker_pids//$'\n'/ }"
+    if docker exec "$NEWAPI_PROXY_CONTAINER" nginx -s reload >/dev/null; then
+      reload_succeeded=1
+      sleep 1
+    else
+      status=1
+    fi
+  fi
   [[ "$(docker inspect --format '{{.State.Status}}' "$NEWAPI_PROXY_CONTAINER" 2>/dev/null || true)" == "running" ]] \
     || status=1
-  if (( status == 0 )) && active_newapi_container >/dev/null 2>&1; then
+  if (( status == 0 )); then
     body="$(curl_newapi --fail --silent --show-error --max-time 5 \
       "$(newapi_origin_url)/api/status" 2>/dev/null || true)"
     printf '%s' "$body" | json_success_response || status=1
   fi
   if (( status != 0 )); then
+    if (( reload_succeeded == 1 )); then
+      rollback_worker_pids="$(proxy_worker_pids || true)"
+      rollback_worker_pids="${rollback_worker_pids//$'\n'/ }"
+    fi
     cat "$backup_dir/nginx-main.conf" >"$runtime_main" || true
     cat "$backup_dir/nginx.conf" >"$runtime_site" || true
-    docker exec "$NEWAPI_PROXY_CONTAINER" nginx -t >/dev/null 2>&1 || true
-    docker exec "$NEWAPI_PROXY_CONTAINER" nginx -s reload >/dev/null 2>&1 || true
+    if docker exec "$NEWAPI_PROXY_CONTAINER" nginx -t >/dev/null 2>&1 \
+      && docker exec "$NEWAPI_PROXY_CONTAINER" nginx -s reload >/dev/null 2>&1; then
+      rollback_succeeded=1
+      PROXY_RETIRED_WORKER_PIDS="$rollback_worker_pids"
+    elif (( reload_succeeded == 1 )); then
+      cat "$REPO_ROOT/proxy/nginx-main.conf" >"$runtime_main" || true
+      cat "$rendered_site" >"$runtime_site" || true
+      log "proxy rollback reload failed; candidate config retained for retry" >&2
+    fi
     rm -rf -- "$backup_dir"
-    log "proxy reload failed; previous files restored" >&2
+    if (( rollback_succeeded == 1 )); then
+      log "proxy reload failed; previous files restored" >&2
+    else
+      log "proxy reload failed; active config retained for retry" >&2
+    fi
     return 1
   fi
   rm -rf -- "$backup_dir"
-  log "proxy configuration validated and reloaded without container restart"
+  PROXY_RETIRED_WORKER_PIDS="$retired_worker_pids"
+  if (( changed == 1 )); then
+    log "proxy now routes new requests to $upstream; retired workers are draining"
+  else
+    log "proxy configuration already routes to $upstream"
+  fi
 }
 
 image_release_marker() {
@@ -563,30 +637,29 @@ remove_retired_newapi_container() {
   docker rm "$container" >/dev/null
 }
 
-newapi_container_network() {
-  local container="$1"
-  docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
-    "$container" | sed -n '1p'
-}
-
-activate_newapi_alias() {
-  local container="$1" network=""
-  network="$(newapi_container_network "$container")"
-  if [[ -z "$network" ]]; then
-    log "candidate has no Docker network: $container" >&2
-    return 1
-  fi
-  docker network disconnect "$network" "$container"
-  docker network connect --alias new-api "$network" "$container"
-}
-
 restore_previous_newapi() {
-  local previous_container="$1" failed_container="$2"
+  local previous_container="$1" failed_container="$2" previous_image="${3:-}"
+  local retired_worker_pids="${PROXY_RETIRED_WORKER_PIDS:-}"
   if [[ -n "$previous_container" ]] && docker inspect "$previous_container" >/dev/null 2>&1; then
     docker update --restart always "$previous_container" >/dev/null 2>&1 || true
     docker start "$previous_container" >/dev/null 2>&1 || true
+    if [[ -n "$previous_image" ]]; then
+      wait_candidate_newapi "$previous_container" "$previous_image" "" || return 1
+    fi
+    sync_proxy_runtime_config "$previous_container" || return 1
+    if [[ -n "$PROXY_RETIRED_WORKER_PIDS" ]]; then
+      retired_worker_pids="$PROXY_RETIRED_WORKER_PIDS"
+    fi
     NEWAPI_CONTAINER="$previous_container"
+  else
+    log "previous New API container is unavailable; failed candidate remains active" >&2
+    return 1
   fi
+  if ! wait_for_proxy_workers_to_exit "$retired_worker_pids"; then
+    log "failed candidate retained until its proxied requests finish: $failed_container" >&2
+    return 1
+  fi
+  PROXY_RETIRED_WORKER_PIDS=""
   if [[ -n "$failed_container" ]] && docker inspect "$failed_container" >/dev/null 2>&1; then
     docker update --restart no "$failed_container" >/dev/null 2>&1 || true
     docker stop --time 30 "$failed_container" >/dev/null 2>&1 || true
@@ -596,15 +669,18 @@ restore_previous_newapi() {
 
 switch_newapi_image() {
   local image="$1" candidate="$2" expected_marker="${3:-}"
-  local previous_container="${4:-}" drain_seconds
+  local previous_container="${4:-}" drain_seconds retired_worker_pids=""
   stage_newapi_container "$image" "$candidate" slave
   wait_candidate_newapi "$candidate" "$image" "$expected_marker"
-  activate_newapi_alias "$candidate"
-  wait_candidate_newapi "$candidate" "$image" "$expected_marker"
-  sleep "${DNS_SETTLE_SECONDS:-4}"
+  sync_proxy_runtime_config "$candidate"
+  retired_worker_pids="$PROXY_RETIRED_WORKER_PIDS"
+  NEWAPI_CONTAINER="$candidate"
+  wait_newapi "$expected_marker" "$image"
 
   if [[ -n "$previous_container" && "$previous_container" != "$candidate" ]] \
     && docker inspect "$previous_container" >/dev/null 2>&1; then
+    wait_for_proxy_workers_to_exit "$retired_worker_pids"
+    PROXY_RETIRED_WORKER_PIDS=""
     docker update --restart no "$previous_container" >/dev/null
     drain_seconds="${NEWAPI_DRAIN_TIMEOUT_SECONDS:-900}"
     if [[ ! "$drain_seconds" =~ ^[0-9]+$ ]]; then
@@ -615,8 +691,6 @@ switch_newapi_image() {
     docker stop --time "$drain_seconds" "$previous_container" >/dev/null
   fi
 
-  NEWAPI_CONTAINER="$candidate"
-  wait_newapi "$expected_marker" "$image"
   set_env_value "$ENV_FILE" NEWAPI_IMAGE "$image"
 }
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Test fixtures override sourced functions and match literal shell source text.
+# shellcheck disable=SC2016,SC2030,SC2031,SC2329
 
 set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -103,8 +105,9 @@ grep -Fq 'serveHTTPUntilShutdown(applicationServer, shutdownSignal.Done(), shutd
 if grep -Rq -- '--force-recreate new-api' "$DEPLOY_DIR/release.sh" "$DEPLOY_DIR/rollback.sh"; then
   fail "release or rollback still force-recreates the active application"
 fi
-grep -Fq 'sync_proxy_runtime_config' "$DEPLOY_DIR/release.sh" \
-  || fail "release does not transactionally reload the runtime proxy configuration"
+if grep -Fq 'sync_proxy_runtime_config' "$DEPLOY_DIR/release.sh"; then
+  fail "release changes the proxy before the candidate passes health checks"
+fi
 grep -Fq 'render_proxy_runtime_site' "$DEPLOY_DIR/_lib.sh" \
   || fail "runtime proxy configuration does not render the Adapter gateway"
 grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
@@ -115,6 +118,74 @@ grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
   render_proxy_runtime_site "$rendered_proxy"
   cmp -s "$REPO_ROOT/proxy/nginx.conf" "$rendered_proxy" \
     || fail "runtime proxy rendering rewrites the tracked source configuration"
+  render_proxy_runtime_site "$rendered_proxy" new-api-candidate
+  grep -Fq 'server new-api-candidate:3000 resolve;' "$rendered_proxy" \
+    || fail "runtime proxy does not target the verified candidate by name"
+  if grep -Fq 'server new-api:3000 resolve;' "$rendered_proxy"; then
+    fail "candidate proxy rendering still targets the shared service alias"
+  fi
+)
+
+(
+  events="$(mktemp)"
+  trap 'rm -f -- "$events"' EXIT
+  stage_newapi_container() { printf 'stage:%s:%s:%s\n' "$1" "$2" "$3" >>"$events"; }
+  wait_candidate_newapi() { printf 'candidate:%s\n' "$1" >>"$events"; }
+  sync_proxy_runtime_config() {
+    printf 'proxy:%s\n' "$1" >>"$events"
+    PROXY_RETIRED_WORKER_PIDS="101 102"
+  }
+  wait_newapi() { printf 'live:%s:%s\n' "$1" "$2" >>"$events"; }
+  wait_for_proxy_workers_to_exit() { printf 'drain:%s\n' "$1" >>"$events"; }
+  set_env_value() { printf 'persist:%s:%s\n' "$2" "$3" >>"$events"; }
+  docker() {
+    case "$1" in
+      inspect) printf 'inspect:%s\n' "${*: -1}" >>"$events" ;;
+      update) printf 'update:%s\n' "${*: -1}" >>"$events" ;;
+      stop) printf 'stop:%s\n' "${*: -1}" >>"$events" ;;
+      *) fail "unexpected Docker call while testing traffic switch: $*" ;;
+    esac
+  }
+  ENV_FILE=/tmp/prox-test.env NEWAPI_DRAIN_TIMEOUT_SECONDS=30 \
+    switch_newapi_image prox-new-api:candidate new-api-candidate marker new-api-old
+  proxy_line="$(grep -n '^proxy:' "$events" | cut -d: -f1)"
+  live_line="$(grep -n '^live:' "$events" | cut -d: -f1)"
+  drain_line="$(grep -n '^drain:' "$events" | cut -d: -f1)"
+  stop_line="$(grep -n '^stop:' "$events" | cut -d: -f1)"
+  [[ "$proxy_line" -lt "$live_line" && "$live_line" -lt "$drain_line" && "$drain_line" -lt "$stop_line" ]] \
+    || fail "traffic switch order is not candidate -> live check -> proxy drain -> old stop"
+)
+
+(
+  events="$(mktemp)"
+  trap 'rm -f -- "$events"' EXIT
+  wait_candidate_newapi() {
+    printf 'health:%s:%s\n' "$1" "$2" >>"$events"
+  }
+  sync_proxy_runtime_config() {
+    printf 'proxy:%s\n' "$1" >>"$events"
+    PROXY_RETIRED_WORKER_PIDS="201 202"
+  }
+  wait_for_proxy_workers_to_exit() {
+    printf 'drain:%s\n' "$1" >>"$events"
+  }
+  docker() {
+    printf 'docker:%s\n' "$*" >>"$events"
+  }
+  restore_previous_newapi new-api-old new-api-failed prox-new-api:previous
+  expected_events="$(printf '%s\n' \
+    'docker:inspect new-api-old' \
+    'docker:update --restart always new-api-old' \
+    'docker:start new-api-old' \
+    'health:new-api-old:prox-new-api:previous' \
+    'proxy:new-api-old' \
+    'drain:201 202' \
+    'docker:inspect new-api-failed' \
+    'docker:update --restart no new-api-failed' \
+    'docker:stop --time 30 new-api-failed' \
+    'docker:rm new-api-failed')"
+  assert_equal "$expected_events" "$(cat "$events")" \
+    "rollback must restore traffic and drain requests before removing the failed candidate"
 )
 
 (
@@ -136,10 +207,14 @@ grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
   docker() {
     case "$*" in
       "exec new-api-proxy nginx -t") return 0 ;;
+      "top new-api-proxy -eo pid,args")
+        printf 'PID COMMAND\n101 nginx: worker process\n'
+        ;;
       "exec new-api-proxy nginx -s reload")
         reload_calls=$((reload_calls + 1))
         (( reload_calls > 1 ))
         ;;
+      "inspect --format {{.State.Status}} new-api-proxy") printf 'running\n' ;;
       *) fail "unexpected docker call during proxy rollback test: $*" ;;
     esac
   }
@@ -150,6 +225,53 @@ grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
     "proxy main config rollback"
   assert_equal old-site "$(cat "$runtime_fixture/nginx.conf")" \
     "proxy site config rollback"
+)
+
+(
+  runtime_fixture="$(mktemp -d)"
+  events="$(mktemp)"
+  trap 'rm -rf -- "$runtime_fixture"; rm -f -- "$events"' EXIT
+  printf '%s\n' old-main >"$runtime_fixture/nginx-main.conf"
+  printf '%s\n' old-site >"$runtime_fixture/nginx.conf"
+  proxy_mount_source() {
+    case "$1" in
+      /etc/nginx/nginx.conf) printf '%s\n' "$runtime_fixture/nginx-main.conf" ;;
+      /etc/nginx/conf.d/default.conf) printf '%s\n' "$runtime_fixture/nginx.conf" ;;
+      *) return 1 ;;
+    esac
+  }
+  render_proxy_runtime_site() {
+    printf '%s\n' candidate-site >"$1"
+  }
+  proxy_worker_pids() {
+    printf 'capture\n' >>"$events"
+    if [[ "$(grep -c '^capture$' "$events")" == "1" ]]; then
+      printf '%s\n' 101
+    else
+      printf '%s\n' 201 202
+    fi
+  }
+  curl_newapi() { printf '%s' '{"success":false}'; }
+  newapi_origin_url() { printf '%s\n' 'http://proxy.test'; }
+  docker() {
+    case "$*" in
+      "exec new-api-proxy nginx -t") return 0 ;;
+      "exec new-api-proxy nginx -s reload") printf 'reload\n' >>"$events" ;;
+      "inspect --format {{.State.Status}} new-api-proxy") printf 'running\n' ;;
+      *) fail "unexpected docker call during failed health rollback test: $*" ;;
+    esac
+  }
+  if sync_proxy_runtime_config new-api-candidate; then
+    fail "failed public proxy health check was accepted"
+  fi
+  assert_equal old-main "$(cat "$runtime_fixture/nginx-main.conf")" \
+    "public health rollback main config"
+  assert_equal old-site "$(cat "$runtime_fixture/nginx.conf")" \
+    "public health rollback site config"
+  assert_equal "$(printf '%s\n' capture reload capture reload)" "$(cat "$events")" \
+    "proxy rollback must capture candidate workers before restoring traffic"
+  assert_equal "201 202" "$PROXY_RETIRED_WORKER_PIDS" \
+    "proxy rollback did not retain candidate worker PIDs for request drain"
 )
 
 printf '%s' '{"success":true}' | json_success_response || fail "valid status response rejected"

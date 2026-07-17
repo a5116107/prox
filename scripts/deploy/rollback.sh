@@ -11,7 +11,6 @@ require_command python3
 require_command flock
 load_deploy_env
 acquire_release_lock
-sync_proxy_runtime_config
 
 CURRENT_CONTAINER="$(active_newapi_container 2>/dev/null || true)"
 CURRENT_WORKER_CONTAINER="$(active_newapi_worker_container 2>/dev/null || true)"
@@ -40,7 +39,8 @@ rollback_on_error() {
   local status=$?
   trap - ERR
   if (( switched == 1 )); then
-    restore_previous_newapi "$CURRENT_CONTAINER" "$ROLLBACK_CONTAINER"
+    restore_previous_newapi "$CURRENT_CONTAINER" "$ROLLBACK_CONTAINER" "$CURRENT_IMAGE" \
+      || log "automatic traffic restore needs operator cleanup"
     restore_previous_newapi_worker "$CURRENT_WORKER_CONTAINER" "$ROLLBACK_WORKER_CONTAINER"
     [[ -z "$CURRENT_IMAGE" ]] || set_env_value "$ENV_FILE" NEWAPI_IMAGE "$CURRENT_IMAGE" || true
     if (( CURRENT_METADATA_PRESENT == 1 )); then

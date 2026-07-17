@@ -40,7 +40,7 @@ sudo chmod 600 .env.deploy
 Fill `.env.deploy`, create the production Compose network, then install Adapter:
 
 ```bash
-docker compose --env-file .env.deploy -f compose.prod.yml up -d postgres redis oauth-worker new-api-proxy
+docker compose --env-file .env.deploy -f compose.prod.yml up -d postgres redis oauth-worker new-api new-api-proxy
 sudo python3 -m venv /opt/prox/venv
 sudo /opt/prox/venv/bin/pip install \
   -r integrations/newapi-hermes-adapter/requirements.txt

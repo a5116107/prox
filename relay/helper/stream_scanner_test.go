@@ -250,18 +250,17 @@ func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {
 func TestStreamScannerHandler_ScannerDecoupledFromSlowHandler(t *testing.T) {
 	t.Parallel()
 
-	const numChunks = 50
-	const upstreamDelay = 10 * time.Millisecond
-	const handlerDelay = 20 * time.Millisecond
+	const numChunks = 8
 
 	pr, pw := io.Pipe()
+	var upstreamConsumed atomic.Bool
 	go func() {
 		defer pw.Close()
 		for i := 0; i < numChunks; i++ {
 			fmt.Fprintf(pw, "data: {\"id\":%d}\n", i)
-			time.Sleep(upstreamDelay)
 		}
 		fmt.Fprint(pw, "data: [DONE]\n")
+		upstreamConsumed.Store(true)
 	}()
 
 	recorder := httptest.NewRecorder()
@@ -272,30 +271,27 @@ func TestStreamScannerHandler_ScannerDecoupledFromSlowHandler(t *testing.T) {
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
 
 	var count atomic.Int64
-	start := time.Now()
-	done := make(chan struct{})
+	var handlerStarted atomic.Bool
+	releaseHandler := make(chan struct{})
+	var done atomic.Bool
 	go func() {
 		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
-			time.Sleep(handlerDelay)
 			count.Add(1)
+			handlerStarted.Store(true)
+			<-releaseHandler
 		})
-		close(done)
+		done.Store(true)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("StreamScannerHandler did not complete in time")
-	}
+	require.Eventually(t, handlerStarted.Load, 2*time.Second, 5*time.Millisecond,
+		"data handler did not start")
+	require.Eventually(t, upstreamConsumed.Load, 2*time.Second, 5*time.Millisecond,
+		"scanner stopped consuming upstream while the handler was blocked")
+	close(releaseHandler)
 
-	elapsed := time.Since(start)
+	require.Eventually(t, done.Load, 2*time.Second, 5*time.Millisecond,
+		"StreamScannerHandler did not finish after the handler was released")
 	assert.Equal(t, int64(numChunks), count.Load())
-
-	coupledTime := time.Duration(numChunks) * (upstreamDelay + handlerDelay)
-	t.Logf("elapsed=%v, coupled_estimate=%v", elapsed, coupledTime)
-
-	assert.Less(t, elapsed, coupledTime*85/100,
-		"decoupled elapsed time (%v) should be significantly less than coupled estimate (%v)", elapsed, coupledTime)
 }
 
 func TestStreamScannerHandler_SlowUpstreamFastHandler(t *testing.T) {

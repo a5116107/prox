@@ -75,7 +75,9 @@ Expected ownership is `/opt/prox/current` for release source,
 `/opt/prox/venv` for the Adapter environment, `/etc/prox/hermes.env` for
 Adapter secrets, and `/var/lib/prox-hermes` for Adapter state. A host-side
 `web/default/dist` change has no production effect until a tagged image is
-built and a verified candidate replaces the active alias after graceful drain.
+built and a verified candidate becomes the explicit Nginx upstream after a
+validated hot reload. The old container remains available until the retired
+Nginx workers finish their existing requests.
 
 ## Backups
 

@@ -75,8 +75,10 @@ bash scripts/deploy/release.sh
 ```
 
 The release script starts and verifies the slave candidate before traffic,
-gracefully drains the previous container, then replaces the single
-`NODE_TYPE=master` worker. It verifies `/api/status`, `/release-marker.txt`,
+renders that exact container name into the bind-mounted Nginx upstream, hot
+reloads Nginx, waits for the retired Nginx workers to drain, and only then
+stops the previous container and replaces the single `NODE_TYPE=master`
+worker. It verifies `/api/status`, `/release-marker.txt`,
 static assets, the quiz route, image configuration, and Adapter health, and
 restores the prior traffic/worker pair on failure. Use
 `scripts/deploy/rollback.sh` for an explicit candidate-first rollback.

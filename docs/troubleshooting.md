@@ -102,3 +102,16 @@ docker logs --tail 300 "${active_container:-new-api}"
 ```
 
 Use `bash scripts/deploy/rollback.sh IMAGE` when an explicit retained image is required.
+
+If a release is waiting rather than failing, inspect the retired Nginx workers
+before taking action:
+
+```bash
+docker top new-api-proxy -eo pid,args | grep 'nginx: worker process'
+runtime_site="$(docker inspect new-api-proxy --format '{{range .Mounts}}{{if eq .Destination "/etc/nginx/conf.d/default.conf"}}{{.Source}}{{end}}{{end}}')"
+grep '^server new-api-' "$runtime_site"
+```
+
+The release keeps the previous application running until the worker PIDs captured
+before the hot reload have exited. `NEWAPI_PROXY_DRAIN_TIMEOUT_SECONDS` bounds
+that wait; increasing it preserves longer streams without restarting Nginx.
