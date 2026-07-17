@@ -2,6 +2,10 @@
 useDefault = true
 
 [[allowlists]]
+description = "Ignored frontend build outputs generated from reviewed source dependencies"
+paths = ['''^web/(?:default|classic)/dist/''']
+
+[[allowlists]]
 description = "API-key masking fixture in the log redaction implementation"
 condition = "AND"
 rules = ["gcp-api-key"]

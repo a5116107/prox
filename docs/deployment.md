@@ -47,7 +47,13 @@ sudo /opt/prox/venv/bin/pip install \
 sudo cp integrations/newapi-hermes-adapter/.env.example /etc/prox/hermes.env
 adapter_gateway="$(docker network inspect prox-prod_new-api-network \
   --format '{{(index .IPAM.Config 0).Gateway}}')"
+server_ip="$(sed -n 's/^SERVER_IP=//p' .env.deploy)"
+test -n "$server_ip"
 sudo sed -i "s/^HERMES_ADAPTER_HOST=.*/HERMES_ADAPTER_HOST=$adapter_gateway/" /etc/prox/hermes.env
+sudo sed -i \
+  -e "s|^NEWAPI_INTERNAL_BASE_URL=.*|NEWAPI_INTERNAL_BASE_URL=http://$server_ip|" \
+  -e "s|^NEWAPI_CHATOPS_BASE_URL=.*|NEWAPI_CHATOPS_BASE_URL=http://$server_ip|" \
+  /etc/prox/hermes.env
 sudo chmod 600 /etc/prox/hermes.env
 sudo cp deploy/systemd/prox-hermes-adapter.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -61,6 +67,12 @@ secret saved under **Operations > Agent Ops**. Keep
 `IMAGE_API_BASE_URL`, `IMAGE_API_KEY`, and the other `IMAGE_*` values are the
 startup and New API outage fallback. A non-empty image key saved in Agent Ops
 takes precedence and is never returned by the normal admin option API.
+
+`NEWAPI_INTERNAL_BASE_URL` and `NEWAPI_CHATOPS_BASE_URL` must point to the
+host's Nginx endpoint in production. Rolling-release candidates deliberately do
+not publish port 3000 on the host, so `http://127.0.0.1:3000` is only a local
+development default. The release preflight and live surface gate verify this
+reverse connection before accepting a release.
 
 The fallback image key must live only in the mode-`0600` environment file.
 Validate a configured fallback provider without printing the key, then start

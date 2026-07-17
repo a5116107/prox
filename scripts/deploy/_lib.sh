@@ -129,6 +129,46 @@ check_hermes_adapter_health() {
   printf '%s\n' "$body"
 }
 
+resolve_hermes_newapi_base_url() {
+  local configured_internal configured_chatops base_url
+  configured_internal="$(read_hermes_adapter_env_value NEWAPI_INTERNAL_BASE_URL)" || return 1
+  configured_chatops="$(read_hermes_adapter_env_value NEWAPI_CHATOPS_BASE_URL)" || return 1
+  base_url="${NEWAPI_INTERNAL_BASE_URL:-$configured_internal}"
+  [[ -n "$base_url" ]] || base_url="${NEWAPI_CHATOPS_BASE_URL:-$configured_chatops}"
+  while [[ "$base_url" == */ ]]; do
+    base_url="${base_url%/}"
+  done
+  case "$base_url" in
+    http://?*|https://?*) ;;
+    *) log "invalid Hermes New API base URL: expected http:// or https://" >&2; return 2 ;;
+  esac
+  [[ "$base_url" != *[[:space:]]* ]] || {
+    log "invalid Hermes New API base URL: whitespace is not allowed" >&2
+    return 2
+  }
+  printf '%s\n' "$base_url"
+}
+
+check_hermes_newapi_connection() {
+  local base_url="${1:-}" configured_secret secret body
+  [[ -n "$base_url" ]] || base_url="$(resolve_hermes_newapi_base_url)" || return 1
+  configured_secret="$(read_hermes_adapter_env_value CHATOPS_WEBHOOK_SECRET)" || return 1
+  secret="${CHATOPS_WEBHOOK_SECRET:-$configured_secret}"
+  [[ -n "$secret" ]] || {
+    log "CHATOPS_WEBHOOK_SECRET is missing from $HERMES_ADAPTER_ENV_FILE" >&2
+    return 1
+  }
+  [[ "$secret" != *$'\r'* && "$secret" != *$'\n'* ]] || {
+    log "CHATOPS_WEBHOOK_SECRET contains an invalid line break" >&2
+    return 1
+  }
+  body="$(curl --fail --silent --show-error \
+    --max-time "${HERMES_NEWAPI_TIMEOUT:-5}" \
+    --header @<(printf 'Authorization: Bearer %s\n' "$secret") \
+    "$base_url/api/agent/chatops/config/export?source=qq")" || return 1
+  printf '%s' "$body" | json_success_response
+}
+
 json_success_response() {
   "$PYTHON_BIN" -c '
 import json
@@ -562,6 +602,7 @@ wait_newapi() {
     adapter_body="$(check_hermes_adapter_health "$adapter_health_url" 2>/dev/null || true)"
     if [[ -n "$static_asset" ]] \
       && check_agent_image_config >/dev/null 2>&1 \
+      && check_hermes_newapi_connection >/dev/null 2>&1 \
       && printf '%s' "$adapter_body" | json_adapter_uses_newapi; then
       surface_ready=1
       break
@@ -569,10 +610,10 @@ wait_newapi() {
     sleep 2
   done
   (( surface_ready == 1 )) || {
-    log "live surface check failed: static assets, image config, or Adapter source is not ready"
+    log "live surface check failed: static assets, image config, Adapter source, or Adapter New API link is not ready"
     return 1
   }
-  log "live surface ready: asset=$static_asset adapter_source=newapi"
+  log "live surface ready: asset=$static_asset adapter_source=newapi adapter_newapi_link=ok"
 }
 
 valid_newapi_container_name() {

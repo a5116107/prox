@@ -38,6 +38,11 @@ if [[ "${SKIP_ADAPTER_CHECK:-0}" != "1" ]]; then
   check_hermes_adapter_health "$adapter_health_url" >/dev/null \
     || die "Hermes adapter health check failed at $adapter_health_url; set SKIP_ADAPTER_CHECK=1 only for adapter bootstrap"
   log "Hermes adapter health check passed at $adapter_health_url"
+  adapter_newapi_url="$(resolve_hermes_newapi_base_url)" \
+    || die "Hermes New API base URL is invalid"
+  check_hermes_newapi_connection "$adapter_newapi_url" >/dev/null \
+    || die "Hermes cannot reach the New API ChatOps endpoint at $adapter_newapi_url"
+  log "Hermes New API connection passed at $adapter_newapi_url"
 fi
 
 log "preflight passed"
