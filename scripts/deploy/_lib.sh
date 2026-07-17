@@ -8,6 +8,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/compose.prod.yml}"
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/.env.deploy}"
 RELEASES_DIR="${RELEASES_DIR:-$REPO_ROOT/releases}"
 NEWAPI_CONTAINER="${NEWAPI_CONTAINER:-new-api}"
+NEWAPI_PROXY_CONTAINER="${NEWAPI_PROXY_CONTAINER:-new-api-proxy}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 HERMES_ADAPTER_ENV_FILE="${HERMES_ADAPTER_ENV_FILE:-/etc/prox/hermes.env}"
 
@@ -206,22 +207,32 @@ extract_static_asset() {
   esac
 }
 
+newapi_origin_url() {
+  printf '%s\n' "${NEWAPI_ORIGIN_URL:-http://${SERVER_IP:-127.0.0.1}}"
+}
+
+curl_newapi() {
+  curl --header "Host: ${PUBLIC_DOMAIN:-localhost}" "$@"
+}
+
 check_newapi_static_assets() {
-  local base_url="http://127.0.0.1:3000" html asset
-  curl --fail --silent --show-error --max-time 5 --output /dev/null \
+  local base_url html asset
+  base_url="$(newapi_origin_url)"
+  curl_newapi --fail --silent --show-error --max-time 5 --output /dev/null \
     "$base_url/favicon.ico" || return 1
-  html="$(curl --fail --silent --show-error --max-time 5 "$base_url/")" || return 1
+  html="$(curl_newapi --fail --silent --show-error --max-time 5 "$base_url/")" || return 1
   asset="$(extract_static_asset "$html")" || return 1
-  curl --fail --silent --show-error --max-time 5 --output /dev/null \
+  curl_newapi --fail --silent --show-error --max-time 5 --output /dev/null \
     "$base_url$asset" || return 1
   printf '%s\n' "$asset"
 }
 
 wait_for_release_marker() {
-  local expected_marker="$1" actual_marker=""
+  local expected_marker="$1" actual_marker="" base_url
+  base_url="$(newapi_origin_url)"
   for _ in $(seq 1 "${MARKER_RETRIES:-15}"); do
-    actual_marker="$(curl --fail --silent --show-error --max-time 5 \
-      http://127.0.0.1:3000/release-marker.txt 2>/dev/null | tr -d '\r\n' || true)"
+    actual_marker="$(curl_newapi --fail --silent --show-error --max-time 5 \
+      "$base_url/release-marker.txt" 2>/dev/null | tr -d '\r\n' || true)"
     if [[ "$actual_marker" == "$expected_marker" ]]; then
       return 0
     fi
@@ -241,8 +252,9 @@ quiz_route_status_is_acceptable() {
 }
 
 check_agent_image_config() {
-  local base_url="http://127.0.0.1:3000" status adapter_auth_value body
-  status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  local base_url status adapter_auth_value body
+  base_url="$(newapi_origin_url)"
+  status="$(curl_newapi --silent --show-error --output /dev/null --write-out '%{http_code}' \
     --max-time 5 "$base_url/api/agent/chatops/image-config?source=qq" || true)"
   case "$status" in
     401|403) ;;
@@ -258,7 +270,7 @@ check_agent_image_config() {
     log "CHATOPS_WEBHOOK_SECRET contains an invalid line break" >&2
     return 1
   }
-  body="$(curl --fail --silent --show-error --max-time 5 \
+  body="$(curl_newapi --fail --silent --show-error --max-time 5 \
     --header @<(printf 'Authorization: Bearer %s\n' "$adapter_auth_value") \
     "$base_url/api/agent/chatops/image-config?source=qq")" || return 1
   printf '%s' "$body" | json_image_config_response
@@ -306,8 +318,90 @@ finally:
 PY
 }
 
+active_newapi_container() {
+  local recorded=""
+  recorded="$(read_env_file_value "$RELEASES_DIR/current.env" ACTIVE_CONTAINER)"
+  if [[ -n "$recorded" ]] && docker inspect "$recorded" >/dev/null 2>&1; then
+    printf '%s\n' "$recorded"
+    return 0
+  fi
+  if docker inspect "$NEWAPI_CONTAINER" >/dev/null 2>&1; then
+    printf '%s\n' "$NEWAPI_CONTAINER"
+    return 0
+  fi
+  return 1
+}
+
 current_container_image() {
-  docker inspect --format '{{.Config.Image}}' "$NEWAPI_CONTAINER" 2>/dev/null || true
+  local container=""
+  container="$(active_newapi_container 2>/dev/null || true)"
+  [[ -n "$container" ]] || return 0
+  docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null || true
+}
+
+proxy_mount_source() {
+  local destination="$1"
+  docker inspect --format '{{range .Mounts}}{{printf "%s\t%s\n" .Destination .Source}}{{end}}' \
+    "$NEWAPI_PROXY_CONTAINER" 2>/dev/null \
+    | awk -F '\t' -v destination="$destination" '$1 == destination {print $2; exit}'
+}
+
+render_proxy_runtime_site() {
+  local output="$1"
+  cp -- "$REPO_ROOT/proxy/nginx.conf" "$output"
+}
+
+sync_proxy_runtime_config() {
+  local runtime_main runtime_site backup_dir rendered_site status=0 body=""
+  runtime_main="$(proxy_mount_source /etc/nginx/nginx.conf)"
+  runtime_site="$(proxy_mount_source /etc/nginx/conf.d/default.conf)"
+  [[ -f "$runtime_main" && -f "$runtime_site" ]] || {
+    log "proxy configuration bind mounts are missing" >&2
+    return 1
+  }
+  backup_dir="$(mktemp -d)"
+  cp -- "$runtime_main" "$backup_dir/nginx-main.conf"
+  cp -- "$runtime_site" "$backup_dir/nginx.conf"
+  rendered_site="$backup_dir/nginx.rendered.conf"
+  render_proxy_runtime_site "$rendered_site" || status=1
+
+  if ! cmp -s "$REPO_ROOT/proxy/nginx-main.conf" "$runtime_main"; then
+    cat "$REPO_ROOT/proxy/nginx-main.conf" >"$runtime_main" || status=1
+  fi
+  if (( status == 0 )) && ! cmp -s "$rendered_site" "$runtime_site"; then
+    cat "$rendered_site" >"$runtime_site" || status=1
+  fi
+  if (( status == 0 )); then
+    docker exec "$NEWAPI_PROXY_CONTAINER" nginx -t >/dev/null 2>&1 || status=1
+  fi
+  if (( status != 0 )); then
+    cat "$backup_dir/nginx-main.conf" >"$runtime_main" || true
+    cat "$backup_dir/nginx.conf" >"$runtime_site" || true
+    docker exec "$NEWAPI_PROXY_CONTAINER" nginx -t >/dev/null 2>&1 || true
+    rm -rf -- "$backup_dir"
+    log "proxy configuration validation failed; previous files restored" >&2
+    return 1
+  fi
+  docker exec "$NEWAPI_PROXY_CONTAINER" nginx -s reload >/dev/null || status=1
+  sleep 1
+  [[ "$(docker inspect --format '{{.State.Status}}' "$NEWAPI_PROXY_CONTAINER" 2>/dev/null || true)" == "running" ]] \
+    || status=1
+  if (( status == 0 )) && active_newapi_container >/dev/null 2>&1; then
+    body="$(curl_newapi --fail --silent --show-error --max-time 5 \
+      "$(newapi_origin_url)/api/status" 2>/dev/null || true)"
+    printf '%s' "$body" | json_success_response || status=1
+  fi
+  if (( status != 0 )); then
+    cat "$backup_dir/nginx-main.conf" >"$runtime_main" || true
+    cat "$backup_dir/nginx.conf" >"$runtime_site" || true
+    docker exec "$NEWAPI_PROXY_CONTAINER" nginx -t >/dev/null 2>&1 || true
+    docker exec "$NEWAPI_PROXY_CONTAINER" nginx -s reload >/dev/null 2>&1 || true
+    rm -rf -- "$backup_dir"
+    log "proxy reload failed; previous files restored" >&2
+    return 1
+  fi
+  rm -rf -- "$backup_dir"
+  log "proxy configuration validated and reloaded without container restart"
 }
 
 image_release_marker() {
@@ -321,7 +415,8 @@ wait_newapi() {
   for _ in $(seq 1 "${HEALTH_RETRIES:-60}"); do
     health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$NEWAPI_CONTAINER" 2>/dev/null || true)"
     if [[ "$health" == "healthy" || "$health" == "running" ]]; then
-      body="$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3000/api/status 2>/dev/null || true)"
+      body="$(curl_newapi --fail --silent --show-error --max-time 5 \
+        "$(newapi_origin_url)/api/status" 2>/dev/null || true)"
       if printf '%s' "$body" | json_success_response; then
         break
       fi
@@ -331,7 +426,7 @@ wait_newapi() {
   printf '%s' "$body" | json_success_response || return 1
 
   if [[ -n "$expected_image" ]]; then
-    actual_image="$(current_container_image)"
+    actual_image="$(docker inspect --format '{{.Config.Image}}' "$NEWAPI_CONTAINER" 2>/dev/null || true)"
     [[ "$actual_image" == "$expected_image" ]] || {
       log "container image mismatch: expected=$expected_image actual=${actual_image:-missing}"
       return 1
@@ -345,8 +440,8 @@ wait_newapi() {
     fi
   fi
 
-  route_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 \
-    "http://127.0.0.1:3000/api/ops/quiz/${COMMUNITY_SITE_ID:-prox}/stats" || true)"
+  route_status="$(curl_newapi --silent --output /dev/null --write-out '%{http_code}' --max-time 5 \
+    "$(newapi_origin_url)/api/ops/quiz/${COMMUNITY_SITE_ID:-prox}/stats" || true)"
   quiz_route_status_is_acceptable "$route_status" || {
     log "quiz API route smoke failed with HTTP $route_status"
     return 1
@@ -371,11 +466,158 @@ wait_newapi() {
   log "live surface ready: asset=$static_asset adapter_source=newapi"
 }
 
-switch_newapi_image() {
-  local image="$1"
-  set_env_value "$ENV_FILE" NEWAPI_IMAGE "$image"
+valid_newapi_container_name() {
+  [[ "$1" =~ ^new-api-[A-Za-z0-9][A-Za-z0-9_.-]{0,100}$ ]]
+}
+
+wait_candidate_newapi() {
+  local container="$1" expected_image="$2" expected_marker="${3:-}"
+  local health="" body="" actual_image="" actual_marker=""
+  for _ in $(seq 1 "${HEALTH_RETRIES:-60}"); do
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+      "$container" 2>/dev/null || true)"
+    if [[ "$health" == "healthy" || "$health" == "running" ]]; then
+      body="$(docker exec "$container" wget -qO- \
+        http://127.0.0.1:3000/api/status 2>/dev/null || true)"
+      if printf '%s' "$body" | json_success_response; then
+        break
+      fi
+    fi
+    sleep 2
+  done
+  printf '%s' "$body" | json_success_response || return 1
+  actual_image="$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null || true)"
+  [[ "$actual_image" == "$expected_image" ]] || {
+    log "candidate image mismatch: expected=$expected_image actual=${actual_image:-missing}"
+    return 1
+  }
+  if [[ -n "$expected_marker" ]]; then
+    actual_marker="$(docker exec "$container" wget -qO- \
+      http://127.0.0.1:3000/release-marker.txt 2>/dev/null | tr -d '\r\n' || true)"
+    [[ "$actual_marker" == "$expected_marker" ]] || {
+      log "candidate marker mismatch: expected=$expected_marker actual=${actual_marker:-missing}"
+      return 1
+    }
+  fi
+}
+
+stage_newapi_container() {
+  local image="$1" container="$2" node_type="${3:-slave}"
+  if ! valid_newapi_container_name "$container"; then
+    log "invalid candidate container name: $container" >&2
+    return 1
+  fi
+  if [[ "$node_type" != "master" && "$node_type" != "slave" ]]; then
+    log "invalid NODE_TYPE for candidate: $node_type" >&2
+    return 1
+  fi
+  if docker inspect "$container" >/dev/null 2>&1; then
+    log "candidate container already exists: $container" >&2
+    return 1
+  fi
   export NEWAPI_IMAGE="$image"
-  compose up -d --no-deps --force-recreate new-api
+  compose run -d --no-deps --name "$container" -e "NODE_TYPE=$node_type" new-api >/dev/null
+  docker update --restart always "$container" >/dev/null
+}
+
+active_newapi_worker_container() {
+  local recorded=""
+  recorded="$(read_env_file_value "$RELEASES_DIR/current.env" ACTIVE_WORKER_CONTAINER)"
+  if [[ -n "$recorded" ]] && docker inspect "$recorded" >/dev/null 2>&1; then
+    printf '%s\n' "$recorded"
+    return 0
+  fi
+  return 1
+}
+
+restore_previous_newapi_worker() {
+  local previous_container="$1" failed_container="$2"
+  if [[ -n "$previous_container" ]] && docker inspect "$previous_container" >/dev/null 2>&1; then
+    docker update --restart always "$previous_container" >/dev/null 2>&1 || true
+    docker start "$previous_container" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$failed_container" ]] && docker inspect "$failed_container" >/dev/null 2>&1; then
+    docker update --restart no "$failed_container" >/dev/null 2>&1 || true
+    docker stop --time 30 "$failed_container" >/dev/null 2>&1 || true
+    docker rm "$failed_container" >/dev/null 2>&1 || true
+  fi
+}
+
+switch_newapi_worker() {
+  local image="$1" candidate="$2" expected_marker="${3:-}" previous_container="${4:-}"
+  if [[ -n "$previous_container" && "$previous_container" != "$candidate" ]] \
+    && docker inspect "$previous_container" >/dev/null 2>&1; then
+    docker update --restart no "$previous_container" >/dev/null
+    docker stop --time "${NEWAPI_WORKER_DRAIN_TIMEOUT_SECONDS:-60}" "$previous_container" >/dev/null
+  fi
+  stage_newapi_container "$image" "$candidate" master
+  wait_candidate_newapi "$candidate" "$image" "$expected_marker"
+}
+
+remove_retired_newapi_container() {
+  local container="$1"
+  [[ -n "$container" ]] || return 0
+  docker inspect "$container" >/dev/null 2>&1 || return 0
+  docker update --restart no "$container" >/dev/null 2>&1 || true
+  docker stop --time 30 "$container" >/dev/null 2>&1 || true
+  docker rm "$container" >/dev/null
+}
+
+newapi_container_network() {
+  local container="$1"
+  docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+    "$container" | sed -n '1p'
+}
+
+activate_newapi_alias() {
+  local container="$1" network=""
+  network="$(newapi_container_network "$container")"
+  if [[ -z "$network" ]]; then
+    log "candidate has no Docker network: $container" >&2
+    return 1
+  fi
+  docker network disconnect "$network" "$container"
+  docker network connect --alias new-api "$network" "$container"
+}
+
+restore_previous_newapi() {
+  local previous_container="$1" failed_container="$2"
+  if [[ -n "$previous_container" ]] && docker inspect "$previous_container" >/dev/null 2>&1; then
+    docker update --restart always "$previous_container" >/dev/null 2>&1 || true
+    docker start "$previous_container" >/dev/null 2>&1 || true
+    NEWAPI_CONTAINER="$previous_container"
+  fi
+  if [[ -n "$failed_container" ]] && docker inspect "$failed_container" >/dev/null 2>&1; then
+    docker update --restart no "$failed_container" >/dev/null 2>&1 || true
+    docker stop --time 30 "$failed_container" >/dev/null 2>&1 || true
+    docker rm "$failed_container" >/dev/null 2>&1 || true
+  fi
+}
+
+switch_newapi_image() {
+  local image="$1" candidate="$2" expected_marker="${3:-}"
+  local previous_container="${4:-}" drain_seconds
+  stage_newapi_container "$image" "$candidate" slave
+  wait_candidate_newapi "$candidate" "$image" "$expected_marker"
+  activate_newapi_alias "$candidate"
+  wait_candidate_newapi "$candidate" "$image" "$expected_marker"
+  sleep "${DNS_SETTLE_SECONDS:-4}"
+
+  if [[ -n "$previous_container" && "$previous_container" != "$candidate" ]] \
+    && docker inspect "$previous_container" >/dev/null 2>&1; then
+    docker update --restart no "$previous_container" >/dev/null
+    drain_seconds="${NEWAPI_DRAIN_TIMEOUT_SECONDS:-900}"
+    if [[ ! "$drain_seconds" =~ ^[0-9]+$ ]]; then
+      log "NEWAPI_DRAIN_TIMEOUT_SECONDS must be numeric" >&2
+      return 1
+    fi
+    log "draining $previous_container for up to ${drain_seconds}s"
+    docker stop --time "$drain_seconds" "$previous_container" >/dev/null
+  fi
+
+  NEWAPI_CONTAINER="$candidate"
+  wait_newapi "$expected_marker" "$image"
+  set_env_value "$ENV_FILE" NEWAPI_IMAGE "$image"
 }
 
 acquire_release_lock() {

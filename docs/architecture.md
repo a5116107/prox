@@ -6,18 +6,19 @@
 Client / QQ / TG
        |
        v
-Nginx proxy ----> new-api image (Go API + embedded Default/Classic assets)
+Nginx proxy ----> active new-api slave (Go API + embedded Default/Classic assets)
                        |                 |
                        v                 v
                  PostgreSQL           Redis
                        ^
+                       +---- one New API master worker (scheduled jobs, no traffic)
                        |
 Hermes Adapter <-------+---- internal chatops/action APIs
        |
        +---- OneBot / Telegram / model endpoint
 ```
 
-`new-api` owns business state and authorization. Hermes normalizes platform events and renders replies; it does not own balances, rewards, memberships, quiz answers, or group permissions.
+The active New API traffic container owns request processing and authorization. A separately tracked master worker owns scheduled jobs and receives no proxy traffic. Hermes normalizes platform events and renders replies; it does not own balances, rewards, memberships, quiz answers, or group permissions.
 
 ## Data ownership
 
@@ -49,8 +50,8 @@ Hermes Adapter <-------+---- internal chatops/action APIs
 
 ## Deployment boundary
 
-The Docker image is the release unit for backend and frontend. `compose.prod.yml` mounts only data and logs into `new-api`. Hermes runs as a separate systemd service with state under `/var/lib/prox-hermes` and is reached from Docker through `host.docker.internal`.
+The Docker image is the release unit for backend and frontend. Releases start a uniquely named slave candidate, verify it before traffic, add it to the stable `new-api` Docker alias, gracefully drain the previous traffic container, and then replace the single master worker. `compose.prod.yml` mounts only data and logs into application containers. Hermes runs as a separate systemd service with state under `/var/lib/prox-hermes` and is reached from Docker through `host.docker.internal`.
 
 ## Scale path
 
-PostgreSQL and Redis are already external to the application image. Adding API replicas requires a stable reverse-proxy upstream, shared session secret, shared Redis/PostgreSQL, and one-time job/Community Bot leadership. The current release tooling deliberately switches one `new-api` service and never recreates stateful services.
+PostgreSQL and Redis are external to the application image. Traffic instances are slaves; exactly one separately tracked master runs scheduled work. The release flow stops the previous master before starting its replacement, while all-node billing work remains fenced by database leases. Stateful services are never recreated by an application release.

@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -46,6 +50,59 @@ var classicBuildFS embed.FS
 
 //go:embed web/classic/dist/index.html
 var classicIndexPage []byte
+
+const defaultGracefulShutdownTimeout = 15 * time.Minute
+
+func resolveGracefulShutdownTimeout(rawTimeout string) (time.Duration, bool) {
+	if rawTimeout == "" {
+		return defaultGracefulShutdownTimeout, true
+	}
+	parsedTimeout, parseErr := time.ParseDuration(rawTimeout)
+	if parseErr != nil || parsedTimeout <= 0 {
+		return defaultGracefulShutdownTimeout, false
+	}
+	return parsedTimeout, true
+}
+
+func serveHTTPUntilShutdown(
+	applicationServer *http.Server,
+	shutdownSignal <-chan struct{},
+	shutdownTimeout time.Duration,
+) error {
+	serveErrors := make(chan error, 1)
+	go func() {
+		serveErrors <- applicationServer.ListenAndServe()
+	}()
+
+	select {
+	case serveErr := <-serveErrors:
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			return nil
+		}
+		return serveErr
+	case <-shutdownSignal:
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelShutdown()
+	common.SysLog("shutdown signal received, draining HTTP requests")
+	shutdownErr := applicationServer.Shutdown(shutdownContext)
+	if shutdownErr != nil {
+		common.SysError("HTTP request drain failed: " + shutdownErr.Error())
+		if closeErr := applicationServer.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			return fmt.Errorf("HTTP request drain failed: %w; forced close failed: %v", shutdownErr, closeErr)
+		}
+	}
+
+	serveErr := <-serveErrors
+	if shutdownErr != nil {
+		return fmt.Errorf("HTTP request drain failed: %w", shutdownErr)
+	}
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		return nil
+	}
+	return serveErr
+}
 
 func main() {
 	startTime := time.Now()
@@ -174,8 +231,8 @@ func main() {
 	}
 
 	// Initialize HTTP server
-	server := gin.New()
-	server.Use(gin.CustomRecovery(func(c *gin.Context, err any) {
+	httpRouter := gin.New()
+	httpRouter.Use(gin.CustomRecovery(func(c *gin.Context, err any) {
 		common.SysLog(fmt.Sprintf("panic detected: %v", err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
@@ -186,11 +243,11 @@ func main() {
 	}))
 	// This will cause SSE not to work!!!
 	//server.Use(gzip.Gzip(gzip.DefaultCompression))
-	server.Use(middleware.RequestId())
-	server.Use(middleware.PoweredBy())
-	server.Use(middleware.CORS())
-	server.Use(middleware.I18n())
-	middleware.SetUpLogger(server)
+	httpRouter.Use(middleware.RequestId())
+	httpRouter.Use(middleware.PoweredBy())
+	httpRouter.Use(middleware.CORS())
+	httpRouter.Use(middleware.I18n())
+	middleware.SetUpLogger(httpRouter)
 	// Initialize session store.
 	// Use site-specific cookie names/domains to avoid stale host-only `session`
 	// cookies left by earlier ai.* <-> api.* split deployments. Browsers can send
@@ -210,14 +267,14 @@ func main() {
 		SameSite: http.SameSiteLaxMode,
 		Domain:   sessionCookieDomain,
 	})
-	server.Use(sessions.Sessions(sessionCookieName, store))
-	server.Use(middleware.CleanupLegacySessionCookies(sessionCookieName, sessionCookieDomain))
+	httpRouter.Use(sessions.Sessions(sessionCookieName, store))
+	httpRouter.Use(middleware.CleanupLegacySessionCookies(sessionCookieName, sessionCookieDomain))
 
 	InjectUmamiAnalytics()
 	InjectGoogleAnalytics()
 
 	// 设置路由
-	router.SetRouter(server, router.ThemeAssets{
+	router.SetRouter(httpRouter, router.ThemeAssets{
 		DefaultBuildFS:   buildFS,
 		DefaultIndexPage: indexPage,
 		ClassicBuildFS:   classicBuildFS,
@@ -231,8 +288,22 @@ func main() {
 	// Log startup success message
 	common.LogStartupSuccess(startTime, port)
 
-	err = server.Run(":" + port)
-	if err != nil {
+	applicationServer := &http.Server{
+		Addr:              ":" + port,
+		Handler:           httpRouter,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+	shutdownSignal, stopSignals := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM,
+	)
+	defer stopSignals()
+	shutdownTimeout, validShutdownTimeout := resolveGracefulShutdownTimeout(
+		os.Getenv("GRACEFUL_SHUTDOWN_TIMEOUT"),
+	)
+	if !validShutdownTimeout {
+		common.SysError("invalid GRACEFUL_SHUTDOWN_TIMEOUT, using 15m")
+	}
+	if err = serveHTTPUntilShutdown(applicationServer, shutdownSignal.Done(), shutdownTimeout); err != nil {
 		common.FatalLog("failed to start HTTP server: " + err.Error())
 	}
 }

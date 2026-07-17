@@ -58,20 +58,24 @@ container, embedded release marker, live routes, and separate Adapter service:
 git -C /opt/prox/current remote -v
 git -C /opt/prox/current status --short --branch
 git -C /opt/prox/current rev-parse HEAD
-docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
-docker inspect new-api --format '{{json .Mounts}}'
-curl -fsS http://127.0.0.1:3000/release-marker.txt
-curl -fsS http://127.0.0.1:3000/api/status
+set -a; source /etc/prox/operations.env; source "$ENV_FILE"; set +a
+active_container="$(sed -n 's/^ACTIVE_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+worker_container="$(sed -n 's/^ACTIVE_WORKER_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+docker inspect "${active_container:-new-api}" --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
+docker inspect "$worker_container" --format '{{.Config.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
+docker inspect "${active_container:-new-api}" --format '{{json .Mounts}}'
+curl -fsS -H "Host: $PUBLIC_DOMAIN" "http://$SERVER_IP/release-marker.txt"
+curl -fsS -H "Host: $PUBLIC_DOMAIN" "http://$SERVER_IP/api/status"
 systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
 sudo bash scripts/deploy/check-adapter-health.sh
-docker exec new-api sh -c 'wget -qO- http://host.docker.internal:18181/health'
+docker exec "${active_container:-new-api}" sh -c 'wget -qO- http://host.docker.internal:18181/health'
 ```
 
 Expected ownership is `/opt/prox/current` for release source,
 `/opt/prox/venv` for the Adapter environment, `/etc/prox/hermes.env` for
 Adapter secrets, and `/var/lib/prox-hermes` for Adapter state. A host-side
 `web/default/dist` change has no production effect until a tagged image is
-built and `new-api` is recreated.
+built and a verified candidate replaces the active alias after graceful drain.
 
 ## Backups
 

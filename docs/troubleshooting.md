@@ -3,9 +3,11 @@
 ## Static chunks or favicon return 502/429
 
 ```bash
-docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}}'
-curl -I http://127.0.0.1:3000/favicon.ico
-curl -fsS http://127.0.0.1:3000/release-marker.txt
+set -a; source /etc/prox/operations.env; source "$ENV_FILE"; set +a
+active_container="$(sed -n 's/^ACTIVE_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+docker inspect "${active_container:-new-api}" --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}}'
+curl -I -H "Host: $PUBLIC_DOMAIN" "http://$SERVER_IP/favicon.ico"
+curl -fsS -H "Host: $PUBLIC_DOMAIN" "http://$SERVER_IP/release-marker.txt"
 docker logs --tail 200 new-api-proxy
 ```
 
@@ -92,9 +94,11 @@ database or log-database outage.
 `release.sh` restores the prior image automatically after a failed switch. Inspect:
 
 ```bash
-cat releases/current.env
-docker inspect new-api --format '{{.Config.Image}} {{.State.Health.Status}} {{.RestartCount}}'
-docker logs --tail 300 new-api
+set -a; source /etc/prox/operations.env; set +a
+cat "$RELEASES_DIR/current.env"
+active_container="$(sed -n 's/^ACTIVE_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+docker inspect "${active_container:-new-api}" --format '{{.Config.Image}} {{.State.Health.Status}} {{.RestartCount}}'
+docker logs --tail 300 "${active_container:-new-api}"
 ```
 
 Use `bash scripts/deploy/rollback.sh IMAGE` when an explicit retained image is required.

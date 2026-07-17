@@ -62,18 +62,24 @@ The `new-api` Docker image is the release unit for both backend code and
 embedded frontend assets. Host-side Go files and `web/*/dist` directories are
 not mounted into the running container.
 
-A production change is live only after a tagged image is built and the
-`new-api` service is recreated. Use:
+A production change is live only after a tagged image is built and a verified
+`NODE_TYPE=slave` candidate has replaced the active traffic container. Load the
+runtime paths before release:
 
 ```bash
+set -a
+source /etc/prox/operations.env
+set +a
 bash scripts/deploy/preflight.sh
 bash scripts/deploy/release.sh
 ```
 
-The release script switches only `new-api`, waits for health, verifies
-`/api/status`, `/release-marker.txt`, the quiz route, and the active image
-identity, then rolls back automatically on failure. Use
-`scripts/deploy/rollback.sh` for an explicit rollback.
+The release script starts and verifies the slave candidate before traffic,
+gracefully drains the previous container, then replaces the single
+`NODE_TYPE=master` worker. It verifies `/api/status`, `/release-marker.txt`,
+static assets, the quiz route, image configuration, and Adapter health, and
+restores the prior traffic/worker pair on failure. Use
+`scripts/deploy/rollback.sh` for an explicit candidate-first rollback.
 
 Never use `docker compose down -v` for an application release. Never replace
 or delete PostgreSQL data, Redis data, TLS material, `.env.deploy`, Adapter

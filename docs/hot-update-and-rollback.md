@@ -17,15 +17,24 @@ bash scripts/deploy/release.sh
 
 1. Locks releases and rejects dirty tracked source.
 2. Validates environment, Compose, free disk, and Adapter health.
-3. Builds `prox-new-api:<UTC>-<commit>` with an embedded release marker.
-4. Records the active image as `PREVIOUS_IMAGE`.
-5. Recreates only `new-api`; PostgreSQL, Redis, proxy, and OAuth Worker stay running.
-6. Waits for container health and `/api/status`.
-7. Verifies `/release-marker.txt`, the favicon, a hashed frontend asset, the
+3. Backs up the proxy's actual bind-mounted files, installs the committed proxy
+   configuration, validates with `nginx -t`, hot reloads, and checks
+   `/api/status` when an active traffic container already exists.
+4. Builds `prox-new-api:<UTC>-<commit>` with an embedded release marker.
+5. Records the active image, traffic container, and worker container.
+6. Starts a `NODE_TYPE=slave` candidate without publishing the application port.
+7. Verifies the candidate health, image, marker, and `/api/status` before traffic.
+8. Adds the healthy candidate to the stable `new-api` Docker alias, waits for
+   DNS propagation, and sends `SIGTERM` to the previous container. The previous
+   process drains existing streams for up to `NEWAPI_DRAIN_TIMEOUT_SECONDS`.
+9. Verifies `/release-marker.txt`, the favicon, a hashed frontend asset, the
    quiz route, and protected/authorized image configuration route.
-8. Verifies the separate Adapter is healthy and has refreshed its image
+10. Starts one `NODE_TYPE=master` worker after the previous master has exited,
+    so candidate warm-up never duplicates scheduled business tasks.
+11. Verifies the separate Adapter is healthy and has refreshed its image
    configuration from New API.
-9. Restores the previous image automatically if any post-switch check fails.
+12. Restarts the previous traffic/worker containers and removes failed candidates
+    automatically if a post-switch check fails.
 
 The GitHub `Container` workflow is reusable and is called by `Quality` only
 after all Go, PostgreSQL concurrency, Python, web, delivery, and secret jobs
@@ -52,13 +61,17 @@ set +a
 bash scripts/deploy/rollback.sh prox-new-api:RELEASE_TAG
 ```
 
-The rollback also switches only `new-api` and repeats live route checks.
+Rollback uses the same candidate-first flow and repeats the live route checks.
 
 After a release or rollback, run the same production probe used by systemd:
 
 ```bash
 sudo bash scripts/deploy/monitor.sh | jq .
-docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
+set -a; source /etc/prox/operations.env; set +a
+active_container="$(sed -n 's/^ACTIVE_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+worker_container="$(sed -n 's/^ACTIVE_WORKER_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+docker inspect "${active_container:-new-api}" --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
+docker inspect "$worker_container" --format '{{.Config.Image}} {{.State.Health.Status}} restarts={{.RestartCount}}'
 ```
 
 ## Compatibility rule

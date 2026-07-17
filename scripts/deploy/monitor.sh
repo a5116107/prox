@@ -97,7 +97,7 @@ check_fresh_file() {
 main() {
   local body expected_marker actual_marker static_asset adapter_url adapter_body
   local used_percent available_kb minimum_free_gb maximum_disk_percent payload status
-  local backup_dir latest_backup restore_state restore_body
+  local backup_dir latest_backup restore_state restore_body active_container worker_container container
   local -a containers
 
   require_command docker
@@ -112,13 +112,21 @@ main() {
 
   RESULTS_FILE="$(mktemp)"
   trap cleanup_monitor EXIT
+  active_container="$(active_newapi_container 2>/dev/null || true)"
+  [[ -n "$active_container" ]] || active_container="$NEWAPI_CONTAINER"
+  NEWAPI_CONTAINER="$active_container"
   read -r -a containers <<<"${MONITOR_CONTAINERS:-new-api new-api-proxy new-api-pg new-api-redis new-api-oauth-worker}"
   for container in "${containers[@]}"; do
+    [[ "$container" != "new-api" ]] || container="$active_container"
     check_container "$container"
   done
+  worker_container="$(active_newapi_worker_container 2>/dev/null || true)"
+  if [[ -n "$worker_container" ]]; then
+    check_container "$worker_container"
+  fi
 
-  body="$(curl --fail --silent --show-error --max-time 5 \
-    http://127.0.0.1:3000/api/status 2>/dev/null || true)"
+  body="$(curl_newapi --fail --silent --show-error --max-time 5 \
+    "$(newapi_origin_url)/api/status" 2>/dev/null || true)"
   if printf '%s' "$body" | json_success_response; then
     record_check api_status true success
   else
@@ -126,8 +134,8 @@ main() {
   fi
 
   expected_marker="$(read_env_file_value "$RELEASES_DIR/current.env" RELEASE_TAG)"
-  actual_marker="$(curl --fail --silent --show-error --max-time 5 \
-    http://127.0.0.1:3000/release-marker.txt 2>/dev/null | tr -d '\r\n' || true)"
+  actual_marker="$(curl_newapi --fail --silent --show-error --max-time 5 \
+    "$(newapi_origin_url)/release-marker.txt" 2>/dev/null | tr -d '\r\n' || true)"
   if [[ -n "$expected_marker" && "$actual_marker" == "$expected_marker" ]]; then
     record_check release_marker true "$actual_marker"
   else

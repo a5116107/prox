@@ -40,7 +40,7 @@ sudo chmod 600 .env.deploy
 Fill `.env.deploy`, create the production Compose network, then install Adapter:
 
 ```bash
-docker compose --env-file .env.deploy -f compose.prod.yml up -d postgres redis oauth-worker
+docker compose --env-file .env.deploy -f compose.prod.yml up -d postgres redis oauth-worker new-api-proxy
 sudo python3 -m venv /opt/prox/venv
 sudo /opt/prox/venv/bin/pip install \
   -r integrations/newapi-hermes-adapter/requirements.txt
@@ -130,7 +130,8 @@ source without printing the image key:
 ```bash
 set -a; source /etc/prox/hermes.env; set +a
 curl -fsS -H "Authorization: Bearer $CHATOPS_WEBHOOK_SECRET" \
-  'http://127.0.0.1:3000/api/agent/chatops/image-config?source=qq' \
+  -H "Host: $PUBLIC_DOMAIN" \
+  "http://$SERVER_IP/api/agent/chatops/image-config?source=qq" \
   | jq -e '.success == true and (.data.api_key_configured | type == "boolean")' >/dev/null
 sleep "${IMAGE_CONFIG_CACHE_TTL_SECONDS:-15}"
 adapter_health_url="${HERMES_ADAPTER_HEALTH_URL:-http://${HERMES_ADAPTER_HOST}:${HERMES_ADAPTER_PORT:-18181}/health}"
@@ -141,9 +142,12 @@ curl -fsS "$adapter_health_url" \
 Release the application image:
 
 ```bash
+cd /opt/prox/current
+set -a
+source /etc/prox/operations.env
+set +a
 bash scripts/deploy/preflight.sh
 bash scripts/deploy/release.sh
-docker compose --env-file .env.deploy -f compose.prod.yml up -d --no-deps new-api-proxy
 ```
 
 For the first release, set `SKIP_ADAPTER_CHECK=1` only while bootstrapping Adapter health.
@@ -151,12 +155,16 @@ For the first release, set `SKIP_ADAPTER_CHECK=1` only while bootstrapping Adapt
 ## Required proof
 
 ```bash
-docker inspect new-api --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} {{.RestartCount}}'
+set -a; source /etc/prox/operations.env; source "$ENV_FILE"; set +a
+active_container="$(sed -n 's/^ACTIVE_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+worker_container="$(sed -n 's/^ACTIVE_WORKER_CONTAINER=//p' "$RELEASES_DIR/current.env")"
+docker inspect "${active_container:-new-api}" --format '{{.Config.Image}} {{.Image}} {{.State.Health.Status}} {{.RestartCount}}'
+docker inspect "$worker_container" --format '{{.Config.Image}} {{.State.Health.Status}} {{.RestartCount}}'
 git -C /opt/prox/current remote -v
 git -C /opt/prox/current status --short --branch
 git -C /opt/prox/current rev-parse HEAD
-curl -fsS http://127.0.0.1:3000/api/status
-curl -fsS http://127.0.0.1:3000/release-marker.txt
+curl -fsS -H "Host: $PUBLIC_DOMAIN" "http://$SERVER_IP/api/status"
+curl -fsS -H "Host: $PUBLIC_DOMAIN" "http://$SERVER_IP/release-marker.txt"
 sudo bash scripts/deploy/check-adapter-health.sh
 sudo bash scripts/deploy/monitor.sh | jq .
 systemctl show prox-hermes-adapter -p FragmentPath -p EnvironmentFiles -p User -p NRestarts --no-pager
@@ -169,17 +177,16 @@ sudo bash -c '
 ```
 
 The checkout must list only GitHub as `origin`. The image tag, image ID, commit,
-and marker must match the release metadata under `releases/current.env`.
+and marker must match the release metadata under `$RELEASES_DIR/current.env`.
 Adapter `FragmentPath` must resolve to `prox-hermes-adapter.service`, its
 environment file to `/etc/prox/hermes.env`, its user to `prox`, and its restart
 count must remain stable. The monitor payload must report every check as true,
 and both backup and restore-drill services must have a successful recent run.
-Existing containers receive the bounded JSON logging policy when they are next
-recreated; `release.sh` applies it to `new-api` on every image switch.
+Candidate containers receive the bounded JSON logging policy before traffic.
 
 ## Firewall
 
-Expose only 80/443 publicly. Bind new-api to loopback and Adapter to the
+Expose only 80/443 publicly. Keep New API on the private Compose network and bind Adapter to the
 `prox-prod` Compose bridge gateway recorded in `/etc/prox/hermes.env`; do not
 publish port 18181. Restrict SSH by source and key authentication. PostgreSQL
 and Redis remain on the Compose network.

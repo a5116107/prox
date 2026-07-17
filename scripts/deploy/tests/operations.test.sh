@@ -59,15 +59,97 @@ ALLOW_LEGACY_QUIZ_ROUTE=1 assert_success "legacy quiz route rejected during roll
   quiz_route_status_is_acceptable 404
 
 (
-  set_env_value() { :; }
   compose() {
     assert_equal "prox-new-api:candidate" "$NEWAPI_IMAGE" \
       "Compose process environment retained the previous image"
-    assert_equal "up -d --no-deps --force-recreate new-api" "$*" \
-      "image switch Compose arguments"
+    assert_equal "run -d --no-deps --name new-api-candidate -e NODE_TYPE=slave new-api" "$*" \
+      "candidate Compose arguments"
+  }
+  docker() {
+    case "$1" in
+      inspect) return 1 ;;
+      update)
+        assert_equal "update --restart always new-api-candidate" "$*" \
+          "candidate restart policy"
+        ;;
+      *) fail "unexpected docker call while staging candidate: $*" ;;
+    esac
   }
   export NEWAPI_IMAGE="prox-new-api:previous"
-  switch_newapi_image "prox-new-api:candidate"
+  stage_newapi_container "prox-new-api:candidate" "new-api-candidate" slave
+)
+
+assert_failure "invalid stage name did not return failure" \
+  stage_newapi_container "prox-new-api:candidate" 'new-api-../../escape' slave
+assert_failure "invalid node type did not return failure" \
+  stage_newapi_container "prox-new-api:candidate" new-api-candidate invalid
+
+assert_success "valid candidate container name rejected" \
+  valid_newapi_container_name new-api-20260717-r7
+assert_failure "unsafe candidate container name accepted" \
+  valid_newapi_container_name 'new-api-../../escape'
+grep -Fq 'server new-api:3000 resolve;' "$REPO_ROOT/proxy/nginx.conf" \
+  || fail "Nginx upstream does not refresh Docker DNS"
+grep -Fq 'server oauth-worker:8787 resolve;' "$REPO_ROOT/proxy/nginx.conf" \
+  || fail "Nginx OAuth upstream does not refresh Docker DNS"
+grep -Fq 'resolver 127.0.0.11 valid=2s ipv6=off;' "$REPO_ROOT/proxy/nginx-main.conf" \
+  || fail "Docker DNS resolver is missing"
+grep -Fq 'applicationServer.Shutdown(shutdownContext)' "$REPO_ROOT/main.go" \
+  || fail "HTTP server does not drain requests on SIGTERM"
+grep -Fq 'serveErrors := make(chan error, 1)' "$REPO_ROOT/main.go" \
+  || fail "HTTP server shutdown can exit before request draining completes"
+grep -Fq 'serveHTTPUntilShutdown(applicationServer, shutdownSignal.Done(), shutdownTimeout)' "$REPO_ROOT/main.go" \
+  || fail "HTTP server does not wait for SIGTERM on the main goroutine"
+if grep -Rq -- '--force-recreate new-api' "$DEPLOY_DIR/release.sh" "$DEPLOY_DIR/rollback.sh"; then
+  fail "release or rollback still force-recreates the active application"
+fi
+grep -Fq 'sync_proxy_runtime_config' "$DEPLOY_DIR/release.sh" \
+  || fail "release does not transactionally reload the runtime proxy configuration"
+grep -Fq 'render_proxy_runtime_site' "$DEPLOY_DIR/_lib.sh" \
+  || fail "runtime proxy configuration does not render the Adapter gateway"
+grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
+  || fail "Compose traffic service can start scheduled master jobs"
+(
+  rendered_proxy="$(mktemp)"
+  trap 'rm -f -- "$rendered_proxy"' EXIT
+  render_proxy_runtime_site "$rendered_proxy"
+  cmp -s "$REPO_ROOT/proxy/nginx.conf" "$rendered_proxy" \
+    || fail "runtime proxy rendering rewrites the tracked source configuration"
+)
+
+(
+  runtime_fixture="$(mktemp -d)"
+  trap 'rm -rf -- "$runtime_fixture"' EXIT
+  printf '%s\n' old-main >"$runtime_fixture/nginx-main.conf"
+  printf '%s\n' old-site >"$runtime_fixture/nginx.conf"
+  proxy_mount_source() {
+    case "$1" in
+      /etc/nginx/nginx.conf) printf '%s\n' "$runtime_fixture/nginx-main.conf" ;;
+      /etc/nginx/conf.d/default.conf) printf '%s\n' "$runtime_fixture/nginx.conf" ;;
+      *) return 1 ;;
+    esac
+  }
+  render_proxy_runtime_site() {
+    printf '%s\n' rendered-site >"$1"
+  }
+  reload_calls=0
+  docker() {
+    case "$*" in
+      "exec new-api-proxy nginx -t") return 0 ;;
+      "exec new-api-proxy nginx -s reload")
+        reload_calls=$((reload_calls + 1))
+        (( reload_calls > 1 ))
+        ;;
+      *) fail "unexpected docker call during proxy rollback test: $*" ;;
+    esac
+  }
+  if sync_proxy_runtime_config; then
+    fail "failed proxy reload was accepted"
+  fi
+  assert_equal old-main "$(cat "$runtime_fixture/nginx-main.conf")" \
+    "proxy main config rollback"
+  assert_equal old-site "$(cat "$runtime_fixture/nginx.conf")" \
+    "proxy site config rollback"
 )
 
 printf '%s' '{"success":true}' | json_success_response || fail "valid status response rejected"
