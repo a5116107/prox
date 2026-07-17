@@ -822,6 +822,9 @@ func firstSyncNonEmpty(values ...string) string {
 }
 
 func groupString(v any) string {
+	if v == nil {
+		return ""
+	}
 	switch value := v.(type) {
 	case string:
 		return strings.TrimSpace(value)
