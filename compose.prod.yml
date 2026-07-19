@@ -51,7 +51,7 @@ services:
         hard: 1048576
     command: ["--log-dir", "/app/logs"]
     environment:
-      SQL_DSN: "host=postgres port=5432 user=newapi password=${PG_PASS} dbname=new-api sslmode=disable"
+      SQL_DSN: "postgresql://newapi:${PG_PASS}@postgres:5432/new-api?sslmode=disable"
       REDIS_CONN_STRING: "redis://:${REDIS_PASS}@redis:6379"
       TZ: Asia/Shanghai
       NODE_TYPE: "slave"

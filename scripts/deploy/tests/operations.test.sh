@@ -112,6 +112,9 @@ grep -Fq 'render_proxy_runtime_site' "$DEPLOY_DIR/_lib.sh" \
   || fail "runtime proxy configuration does not render the Adapter gateway"
 grep -Fq '      NODE_TYPE: "slave"' "$REPO_ROOT/compose.prod.yml" \
   || fail "Compose traffic service can start scheduled master jobs"
+grep -Fq '      SQL_DSN: "postgresql://newapi:${PG_PASS}@postgres:5432/new-api?sslmode=disable"' \
+  "$REPO_ROOT/compose.prod.yml" \
+  || fail "Compose PostgreSQL DSN can be misclassified as MySQL"
 (
   docker() {
     [[ "$1" == "inspect" ]] || fail "unexpected Docker call while resolving the proxy gateway: $*"
