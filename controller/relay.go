@@ -337,7 +337,8 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
-	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+	retryableDiskStorageError := isRetryableUpstreamDiskStorageError(openaiErr)
+	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) && !retryableDiskStorageError {
 		return false
 	}
 	if types.IsChannelError(openaiErr) {
@@ -362,7 +363,23 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
 	}
+	if retryableDiskStorageError {
+		service.ClearCurrentChannelAffinityCache(c)
+		return true
+	}
 	return operation_setting.ShouldRetryByStatusCode(code)
+}
+
+func isRetryableUpstreamDiskStorageError(openaiErr *types.NewAPIError) bool {
+	if openaiErr == nil || openaiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	message := strings.ToLower(openaiErr.Error())
+	if !strings.Contains(message, "disk free-space floor reached") {
+		return false
+	}
+	return strings.Contains(message, "disk storage creation failed") ||
+		strings.Contains(message, "failed to write to temp file")
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
