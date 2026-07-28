@@ -163,7 +163,7 @@ main() {
     record_check adapter_health false unavailable_or_stale_source
   fi
 
-  if check_hermes_newapi_connection >/dev/null 2>&1; then
+  if check_hermes_newapi_connection "" >/dev/null 2>&1; then
     record_check adapter_newapi_link true config_export_reachable
   else
     record_check adapter_newapi_link false config_export_unreachable

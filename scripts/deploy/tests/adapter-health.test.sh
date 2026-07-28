@@ -99,12 +99,12 @@ fi
 
 PATH="$temp_dir/bin:$PATH" FAKE_CURL_BODY='{"success":true,"data":{}}' \
   HERMES_ADAPTER_ENV_FILE="$temp_dir/hermes.env" \
-  check_hermes_newapi_connection >/dev/null \
+  check_hermes_newapi_connection "" >/dev/null \
   || { printf 'FAIL: healthy Adapter New API link was rejected\n' >&2; exit 1; }
 
 if PATH="$temp_dir/bin:$PATH" FAKE_CURL_BODY='{"success":false}' \
   HERMES_ADAPTER_ENV_FILE="$temp_dir/hermes.env" \
-  check_hermes_newapi_connection >/dev/null 2>&1; then
+  check_hermes_newapi_connection "" >/dev/null 2>&1; then
   printf 'FAIL: failed Adapter New API link was accepted\n' >&2
   exit 1
 fi

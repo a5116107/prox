@@ -656,7 +656,7 @@ wait_newapi() {
     adapter_body="$(check_hermes_adapter_health "$adapter_health_url" 2>/dev/null || true)"
     if [[ -n "$static_asset" ]] \
       && check_agent_image_config >/dev/null 2>&1 \
-      && check_hermes_newapi_connection >/dev/null 2>&1 \
+      && check_hermes_newapi_connection "" >/dev/null 2>&1 \
       && printf '%s' "$adapter_body" | json_adapter_uses_newapi; then
       surface_ready=1
       break

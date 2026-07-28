@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317
 # Test fixtures override sourced functions and match literal shell source text.
 # shellcheck disable=SC2016,SC2030,SC2031,SC2329
 
