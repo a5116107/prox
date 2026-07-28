@@ -244,13 +244,19 @@ class QuizGame(GamePlugin):
     @staticmethod
     def _friendly_error(error, username):
         message = str(error or "").strip()
+        lower = message.lower()
         if "user daily limit reached" in message:
             limit = message.rsplit(":", 1)[-1].strip()
             return f"@{username} 今天答题次数已达上限（{limit} 次），明天再来！"
         if "group daily limit reached" in message:
             limit = message.rsplit(":", 1)[-1].strip()
             return f"@{username} 今天本群题目轮次已达上限（{limit} 题），明天再来！"
-        if "no published questions" in message or "record not found" in message.lower():
+        if "quiz reward blocked:" in lower:
+            return (
+                f"@{username} 答案正确，但当前群聊身份还不满足领奖条件。"
+                "请先发送「验牌」确认绑定和群成员状态，再重新作答领奖。"
+            )
+        if "no published questions" in message or "record not found" in lower:
             return "📝 当前没有已发布并绑定到本群的题库，请管理员在后台题库管理中发布题目。"
         return f"@{username} 答题服务暂时未完成本次操作：{message or 'unknown error'}"
 

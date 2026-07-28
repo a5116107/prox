@@ -178,6 +178,7 @@ def test_quiz_binding_result_does_not_consume_cached_round(monkeypatch):
         ("quiz user daily limit reached: 3", "3 次"),
         ("quiz group daily limit reached: 8", "8 题"),
         ("quiz bank has no published questions", "没有已发布并绑定"),
+        ("quiz reward blocked: unbound_observed", "验牌"),
     ],
 )
 def test_quiz_translates_backend_errors(message, expected):
