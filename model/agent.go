@@ -294,6 +294,19 @@ func ListAgentActions(siteId string, limit int) ([]AgentAction, error) {
 	return rows, err
 }
 
+func GetAgentActionByIdempotencyKey(siteId string, idempotencyKey string) (*AgentAction, error) {
+	var action AgentAction
+	err := DB.Where(
+		"site_id = ? AND idempotency_key = ?",
+		strings.TrimSpace(siteId),
+		strings.TrimSpace(idempotencyKey),
+	).First(&action).Error
+	if err != nil {
+		return nil, err
+	}
+	return &action, nil
+}
+
 func ListAgentEvents(siteId string, limit int) ([]AgentEvent, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50

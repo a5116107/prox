@@ -2473,7 +2473,7 @@ def _membership_notice_metadata(base=None, username="", ident=None, extra=None):
     return meta
 
 
-def _qq_notice_identity(room_id, user_id, raw=None):
+def _qq_notice_identity(room_id, user_id, raw=None, allow_member_lookup=True):
     raw = raw or {}
     sender = raw.get("sender") or {}
     username = _first_nonempty(
@@ -2488,7 +2488,9 @@ def _qq_notice_identity(room_id, user_id, raw=None):
     )
     ident = resolve_identity_via_newapi("qq", room_id, user_id, username)
     profile = {}
-    if not username or not (isinstance(ident, dict) and ident.get("new_api_user_id")):
+    if allow_member_lookup and (
+        not username or not (isinstance(ident, dict) and ident.get("new_api_user_id"))
+    ):
         profile = _fetch_qq_member_profile(room_id, user_id)
         fetched_name = _first_nonempty(profile.get("card"), profile.get("nickname"))
         if fetched_name and not username:
@@ -4825,7 +4827,9 @@ def _start_qq_image_job(
 
 def _membership_endpoint():
     base = (
-        os.environ.get("NEW_API_INTERNAL_BASE_URL")
+        os.environ.get("NEWAPI_INTERNAL_BASE_URL")
+        or os.environ.get("NEW_API_INTERNAL_BASE_URL")
+        or os.environ.get("NEWAPI_CHATOPS_BASE_URL")
         or os.environ.get("NEW_API_CHATOPS_BASE_URL")
         or "http://127.0.0.1:3000"
     ).rstrip("/")
@@ -4846,14 +4850,64 @@ def _membership_secret():
 
 _membership_retry_queue = []
 _membership_retry_lock = threading.Lock()
+_membership_retry_flush_active = False
+_membership_retry_timer = None
 
 
-def _queue_membership_retry(payload):
+def _membership_retry_int(name, default, minimum=1):
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, int(default))
+
+
+def _membership_retry_float(name, default, minimum=0.0):
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, float(default))
+
+
+def _membership_retry_delay(attempts):
+    base = _membership_retry_float("NEW_API_MEMBERSHIP_RETRY_BASE_DELAY_SECONDS", 5.0)
+    maximum = max(
+        base,
+        _membership_retry_float("NEW_API_MEMBERSHIP_RETRY_MAX_DELAY_SECONDS", 300.0),
+    )
+    return min(maximum, base * (2 ** max(0, int(attempts) - 1)))
+
+
+def _membership_retry_entry(item):
+    if isinstance(item, dict) and isinstance(item.get("payload"), dict):
+        return {
+            "payload": item["payload"],
+            "attempts": max(0, int(item.get("attempts") or 0)),
+            "next_retry_at": float(item.get("next_retry_at") or 0),
+        }
+    return {"payload": item, "attempts": 0, "next_retry_at": 0.0}
+
+
+def _queue_membership_retry(payload, attempts=0, next_retry_at=None):
+    attempts = max(0, int(attempts or 0))
+    if next_retry_at is None:
+        next_retry_at = time.time() + _membership_retry_delay(attempts)
+    entry = {
+        "payload": payload,
+        "attempts": attempts,
+        "next_retry_at": float(next_retry_at),
+    }
     with _membership_retry_lock:
-        _membership_retry_queue.append(payload)
-        max_size = int(os.environ.get("NEW_API_MEMBERSHIP_RETRY_QUEUE_MAX", "200"))
+        event_id = str((payload or {}).get("event_id") or "").strip()
+        if event_id:
+            for queued in _membership_retry_queue:
+                normalized = _membership_retry_entry(queued)
+                if str(normalized["payload"].get("event_id") or "") == event_id:
+                    return False
+        _membership_retry_queue.append(entry)
+        max_size = _membership_retry_int("NEW_API_MEMBERSHIP_RETRY_QUEUE_MAX", 200)
         if len(_membership_retry_queue) > max_size:
             del _membership_retry_queue[:-max_size]
+    return True
 
 
 def _post_membership_payload(payload):
@@ -4872,24 +4926,101 @@ def _post_membership_payload(payload):
 
 
 def flush_membership_retry_queue():
+    now = time.time()
+    batch_size = _membership_retry_int("NEW_API_MEMBERSHIP_RETRY_BATCH_SIZE", 10)
     with _membership_retry_lock:
-        pending = list(_membership_retry_queue)
-        _membership_retry_queue.clear()
-    failed = []
-    for payload in pending:
+        pending = []
+        deferred = []
+        for item in _membership_retry_queue:
+            entry = _membership_retry_entry(item)
+            if len(pending) < batch_size and entry["next_retry_at"] <= now:
+                pending.append(entry)
+            else:
+                deferred.append(entry)
+        _membership_retry_queue[:] = deferred
+    sent = 0
+    failed = 0
+    dropped = 0
+    max_attempts = _membership_retry_int("NEW_API_MEMBERSHIP_RETRY_MAX_ATTEMPTS", 5)
+    for entry in pending:
+        payload = entry["payload"]
         try:
             _post_membership_payload(payload)
+            sent += 1
         except Exception as e:
+            attempts = entry["attempts"] + 1
+            if attempts >= max_attempts:
+                dropped += 1
+                print(
+                    f"[MembershipRisk] retry dropped event={payload.get('event_id')} attempts={attempts}: {e}",
+                    flush=True,
+                )
+                continue
+            failed += 1
             print(
-                f"[MembershipRisk] retry failed event={payload.get('event_id')}: {e}",
+                f"[MembershipRisk] retry failed event={payload.get('event_id')} attempts={attempts}/{max_attempts}: {e}",
                 flush=True,
             )
-            failed.append(payload)
-    if failed:
-        with _membership_retry_lock:
-            _membership_retry_queue[:0] = failed[
-                -int(os.environ.get("NEW_API_MEMBERSHIP_RETRY_QUEUE_MAX", "200")) :
-            ]
+            _queue_membership_retry(
+                payload,
+                attempts=attempts,
+                next_retry_at=now + _membership_retry_delay(attempts),
+            )
+    return {"sent": sent, "failed": failed, "dropped": dropped}
+
+
+def _arm_membership_retry_timer():
+    global _membership_retry_timer
+    with _membership_retry_lock:
+        if _membership_retry_timer is not None and _membership_retry_timer.is_alive():
+            return False
+        if not _membership_retry_queue:
+            return False
+        next_retry_at = min(
+            _membership_retry_entry(item)["next_retry_at"]
+            for item in _membership_retry_queue
+        )
+        delay = max(0.05, next_retry_at - time.time())
+        _membership_retry_timer = threading.Timer(delay, _membership_retry_timer_fired)
+        _membership_retry_timer.daemon = True
+        _membership_retry_timer.start()
+    return True
+
+
+def _membership_retry_timer_fired():
+    global _membership_retry_timer
+    with _membership_retry_lock:
+        _membership_retry_timer = None
+    _schedule_membership_retry_flush()
+
+
+def _schedule_membership_retry_flush():
+    global _membership_retry_flush_active
+    now = time.time()
+    with _membership_retry_lock:
+        if _membership_retry_flush_active:
+            return False
+        due = any(
+            _membership_retry_entry(item)["next_retry_at"] <= now
+            for item in _membership_retry_queue
+        )
+        if due:
+            _membership_retry_flush_active = True
+    if not due:
+        _arm_membership_retry_timer()
+        return False
+
+    def worker():
+        global _membership_retry_flush_active
+        try:
+            flush_membership_retry_queue()
+        finally:
+            with _membership_retry_lock:
+                _membership_retry_flush_active = False
+            _arm_membership_retry_timer()
+
+    threading.Thread(target=worker, name="membership-retry", daemon=True).start()
+    return True
 
 
 def forward_membership_event(
@@ -4903,7 +5034,7 @@ def forward_membership_event(
     metadata=None,
     raw_payload=None,
 ):
-    flush_membership_retry_queue()
+    _schedule_membership_retry_flush()
     event_at = int(event_at or time.time())
     payload = {
         "event_id": event_id
@@ -4920,7 +5051,8 @@ def forward_membership_event(
     try:
         return _post_membership_payload(payload)
     except Exception:
-        _queue_membership_retry(payload)
+        _queue_membership_retry(payload, attempts=1)
+        _arm_membership_retry_timer()
         raise
 
 
@@ -5116,7 +5248,9 @@ def handle_onebot_notice(req, raw):
     if nt == "group_decrease" and gid:
         print(f"[OneBot] Member left: {uid}", flush=True)
         operator_id = str(raw.get("operator_id", "")).strip()
-        ident, username, profile = _qq_notice_identity(gid, uid, raw)
+        ident, username, profile = _qq_notice_identity(
+            gid, uid, raw, allow_member_lookup=False
+        )
         try:
             event_type = "kick" if str(sub).lower() == "kick" else "leave"
             forward_membership_event(

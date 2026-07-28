@@ -43,6 +43,11 @@ if [[ "${SKIP_ADAPTER_CHECK:-0}" != "1" ]]; then
   check_hermes_newapi_connection "$adapter_newapi_url" >/dev/null \
     || die "Hermes cannot reach the New API ChatOps endpoint at $adapter_newapi_url"
   log "Hermes New API connection passed at $adapter_newapi_url"
+  adapter_openai_url="$(resolve_hermes_openai_base_url)" \
+    || die "Hermes OpenAI base URL is invalid"
+  check_hermes_model_connection "$adapter_openai_url" >/dev/null \
+    || die "Hermes cannot reach the model endpoint at $adapter_openai_url"
+  log "Hermes model connection passed at $adapter_openai_url"
 fi
 
 log "preflight passed"

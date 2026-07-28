@@ -53,6 +53,7 @@ sudo sed -i "s/^HERMES_ADAPTER_HOST=.*/HERMES_ADAPTER_HOST=$adapter_gateway/" /e
 sudo sed -i \
   -e "s|^NEWAPI_INTERNAL_BASE_URL=.*|NEWAPI_INTERNAL_BASE_URL=http://$server_ip|" \
   -e "s|^NEWAPI_CHATOPS_BASE_URL=.*|NEWAPI_CHATOPS_BASE_URL=http://$server_ip|" \
+  -e "s|^OPENAI_BASE_URL=.*|OPENAI_BASE_URL=http://$server_ip/v1|" \
   /etc/prox/hermes.env
 sudo chmod 600 /etc/prox/hermes.env
 sudo cp deploy/systemd/prox-hermes-adapter.service /etc/systemd/system/
@@ -71,8 +72,9 @@ takes precedence and is never returned by the normal admin option API.
 `NEWAPI_INTERNAL_BASE_URL` and `NEWAPI_CHATOPS_BASE_URL` must point to the
 host's Nginx endpoint in production. Rolling-release candidates deliberately do
 not publish port 3000 on the host, so `http://127.0.0.1:3000` is only a local
-development default. The release preflight and live surface gate verify this
-reverse connection before accepting a release.
+development default. `OPENAI_BASE_URL` must use the same endpoint with `/v1`.
+The release preflight verifies both the ChatOps export and authenticated model
+listing before accepting a release.
 
 The fallback image key must live only in the mode-`0600` environment file.
 Validate a configured fallback provider without printing the key, then start

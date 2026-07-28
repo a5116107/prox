@@ -494,6 +494,21 @@ func AgentCreateAction(req AgentActionRequest, reviewerId int) (*model.AgentActi
 	if gameAction && req.ActionType == "reward.grant.small" {
 		payload["admin_chatops_authorized"] = true
 	}
+	idempotencyKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempotencyKey == "" {
+		idempotencyKey = buildAgentIdempotencyKey(req)
+	}
+	replayCandidate := &model.AgentAction{
+		SiteId: AgentSiteID(), ActionType: req.ActionType, AgentName: req.AgentName,
+		TargetType: req.TargetType, TargetId: req.TargetId, UserId: req.UserId,
+		QuotaAmount: req.QuotaAmount, BudgetPool: req.BudgetPool,
+		IdempotencyKey: idempotencyKey, Reason: req.Reason, PayloadJson: mustAgentJSON(payload),
+	}
+	if replay, found, replayErr := findAgentActionReplay(replayCandidate); found {
+		return replay, replayErr
+	} else if replayErr != nil {
+		return nil, replayErr
+	}
 	risk, _ := AgentRiskEvaluate(req.UserId, payload)
 	adminAuthorized := agentBoolPayload(payload, "admin_chatops_authorized")
 	forceApproval := req.ForceApproval || agentBoolPayload(payload, "force_approval", "requires_approval", "hermes_requires_approval")
@@ -508,10 +523,6 @@ func AgentCreateAction(req AgentActionRequest, reviewerId int) (*model.AgentActi
 		status = "queued"
 		result = map[string]any{"mode": "executor", "message": "action queued for guarded execution"}
 	}
-	idempotencyKey := strings.TrimSpace(req.IdempotencyKey)
-	if idempotencyKey == "" {
-		idempotencyKey = buildAgentIdempotencyKey(req)
-	}
 	action := &model.AgentAction{SiteId: AgentSiteID(), ActionType: req.ActionType, AgentName: req.AgentName, TargetType: req.TargetType, TargetId: req.TargetId, UserId: req.UserId, RiskLevel: tool.RiskLevel, QuotaAmount: req.QuotaAmount, BudgetPool: req.BudgetPool, ApprovalRequired: approvalRequired, Status: status, IdempotencyKey: idempotencyKey, Reason: req.Reason, PayloadJson: mustAgentJSON(payload), ResultJson: mustAgentJSON(result)}
 	if risk != nil {
 		action.RiskLevel = risk.Level
@@ -522,6 +533,9 @@ func AgentCreateAction(req AgentActionRequest, reviewerId int) (*model.AgentActi
 		approval = &model.AgentActionApproval{SiteId: AgentSiteID(), Status: "pending", RequestedBy: req.AgentName, ExpiresAt: time.Now().Add(72 * time.Hour).Unix()}
 	}
 	if err := model.CreateAgentActionWithApproval(action, approval); err != nil {
+		if replay, found, replayErr := findAgentActionReplay(action); found {
+			return replay, replayErr
+		}
 		return nil, err
 	}
 	if approvalRequired {
@@ -538,6 +552,32 @@ func AgentCreateAction(req AgentActionRequest, reviewerId int) (*model.AgentActi
 	}
 	_ = model.DB.Create(&model.AgentEvent{SiteId: AgentSiteID(), EventType: "action.created", Source: "agent_api", Severity: "info", Status: "closed", ActorType: "admin", ActorUserId: reviewerId, Title: req.ActionType, PayloadJson: action.PayloadJson, ResultJson: action.ResultJson}).Error
 	return action, nil
+}
+
+func findAgentActionReplay(candidate *model.AgentAction) (*model.AgentAction, bool, error) {
+	if candidate == nil || strings.TrimSpace(candidate.IdempotencyKey) == "" {
+		return nil, false, nil
+	}
+	existing, err := model.GetAgentActionByIdempotencyKey(candidate.SiteId, candidate.IdempotencyKey)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	compatible := existing.ActionType == candidate.ActionType &&
+		existing.AgentName == candidate.AgentName &&
+		existing.TargetType == candidate.TargetType &&
+		existing.TargetId == candidate.TargetId &&
+		existing.UserId == candidate.UserId &&
+		existing.QuotaAmount == candidate.QuotaAmount &&
+		existing.BudgetPool == candidate.BudgetPool &&
+		existing.Reason == candidate.Reason &&
+		existing.PayloadJson == candidate.PayloadJson
+	if !compatible {
+		return nil, true, fmt.Errorf("idempotency key conflict for different agent action: %s", candidate.IdempotencyKey)
+	}
+	return existing, true, nil
 }
 
 func AgentDecideApproval(approvalId int, reviewerId int, decision string, comment string) error {

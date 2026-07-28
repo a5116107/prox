@@ -26,6 +26,8 @@ HERMES_ADAPTER_PORT=18182
 NEWAPI_INTERNAL_BASE_URL=http://154.9.253.192/
 NEWAPI_CHATOPS_BASE_URL=https://unused.example.test
 CHATOPS_WEBHOOK_SECRET=adapter-secret
+OPENAI_BASE_URL=http://154.9.253.192/v1/
+OPENAI_API_KEY=model-secret
 EOF
 actual="$(HERMES_ADAPTER_ENV_FILE="$temp_dir/hermes.env" resolve_hermes_adapter_health_url)"
 assert_equal "http://172.19.0.1:18182/health" "$actual" "Docker gateway values from hermes.env"
@@ -54,6 +56,13 @@ EOF
 actual="$(HERMES_ADAPTER_ENV_FILE="$temp_dir/chatops-only.env" \
   resolve_hermes_newapi_base_url)"
 assert_equal "https://chatops.internal" "$actual" "ChatOps base URL fallback"
+
+actual="$(HERMES_ADAPTER_ENV_FILE="$temp_dir/hermes.env" resolve_hermes_openai_base_url)"
+assert_equal "http://154.9.253.192/v1" "$actual" "OpenAI base URL from hermes.env"
+
+actual="$(HERMES_ADAPTER_ENV_FILE="$temp_dir/chatops-only.env" \
+  resolve_hermes_openai_base_url)"
+assert_equal "https://chatops.internal/v1" "$actual" "OpenAI base URL derived from New API"
 
 if HERMES_ADAPTER_ENV_FILE="$missing_env" NEWAPI_INTERNAL_BASE_URL=file:///tmp/new-api \
   resolve_hermes_newapi_base_url >/dev/null 2>&1; then
@@ -100,4 +109,16 @@ if PATH="$temp_dir/bin:$PATH" FAKE_CURL_BODY='{"success":false}' \
   exit 1
 fi
 
-printf 'PASS: Hermes adapter health and New API connection\n'
+PATH="$temp_dir/bin:$PATH" FAKE_CURL_BODY='{"data":[]}' \
+  HERMES_ADAPTER_ENV_FILE="$temp_dir/hermes.env" \
+  check_hermes_model_connection >/dev/null \
+  || { printf 'FAIL: healthy Hermes model link was rejected\n' >&2; exit 1; }
+
+if PATH="$temp_dir/bin:$PATH" FAKE_CURL_BODY='{"error":{"message":"down"}}' \
+  HERMES_ADAPTER_ENV_FILE="$temp_dir/hermes.env" \
+  check_hermes_model_connection >/dev/null 2>&1; then
+  printf 'FAIL: failed Hermes model link was accepted\n' >&2
+  exit 1
+fi
+
+printf 'PASS: Hermes adapter health, New API, and model connections\n'

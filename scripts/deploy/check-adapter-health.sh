@@ -20,3 +20,9 @@ newapi_url="$(resolve_hermes_newapi_base_url)" \
 check_hermes_newapi_connection "$newapi_url" >/dev/null \
   || die "Hermes cannot reach the New API ChatOps endpoint at $newapi_url"
 log "Hermes can reach New API at $newapi_url"
+
+openai_url="$(resolve_hermes_openai_base_url)" \
+  || die "Hermes OpenAI base URL is invalid"
+check_hermes_model_connection "$openai_url" >/dev/null \
+  || die "Hermes cannot reach the model endpoint at $openai_url"
+log "Hermes can reach the model endpoint at $openai_url"

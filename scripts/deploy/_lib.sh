@@ -149,6 +149,28 @@ resolve_hermes_newapi_base_url() {
   printf '%s\n' "$base_url"
 }
 
+resolve_hermes_openai_base_url() {
+  local configured base_url newapi_url
+  configured="$(read_hermes_adapter_env_value OPENAI_BASE_URL)" || return 1
+  base_url="${OPENAI_BASE_URL:-$configured}"
+  if [[ -z "$base_url" ]]; then
+    newapi_url="$(resolve_hermes_newapi_base_url)" || return 1
+    base_url="$newapi_url/v1"
+  fi
+  while [[ "$base_url" == */ ]]; do
+    base_url="${base_url%/}"
+  done
+  case "$base_url" in
+    http://?*|https://?*) ;;
+    *) log "invalid Hermes OpenAI base URL: expected http:// or https://" >&2; return 2 ;;
+  esac
+  [[ "$base_url" != *[[:space:]]* ]] || {
+    log "invalid Hermes OpenAI base URL: whitespace is not allowed" >&2
+    return 2
+  }
+  printf '%s\n' "$base_url"
+}
+
 check_hermes_newapi_connection() {
   local base_url="${1:-}" configured_secret secret body
   [[ -n "$base_url" ]] || base_url="$(resolve_hermes_newapi_base_url)" || return 1
@@ -167,6 +189,38 @@ check_hermes_newapi_connection() {
     --header @<(printf 'Authorization: Bearer %s\n' "$secret") \
     "$base_url/api/agent/chatops/config/export?source=qq")" || return 1
   printf '%s' "$body" | json_success_response
+}
+
+check_hermes_model_connection() {
+  local base_url="${1:-}" configured_key key body
+  [[ -n "$base_url" ]] || base_url="$(resolve_hermes_openai_base_url)" || return 1
+  configured_key="$(read_hermes_adapter_env_value OPENAI_API_KEY)" || return 1
+  key="${OPENAI_API_KEY:-$configured_key}"
+  [[ -n "$key" ]] || {
+    log "OPENAI_API_KEY is missing from $HERMES_ADAPTER_ENV_FILE" >&2
+    return 1
+  }
+  [[ "$key" != *$'\r'* && "$key" != *$'\n'* ]] || {
+    log "OPENAI_API_KEY contains an invalid line break" >&2
+    return 1
+  }
+  body="$(curl --fail --silent --show-error \
+    --max-time "${HERMES_MODEL_CONNECTION_TIMEOUT:-10}" \
+    --header @<(printf 'Authorization: Bearer %s\n' "$key") \
+    "$base_url/models")" || return 1
+  printf '%s' "$body" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(payload, dict) or payload.get("error"):
+    raise SystemExit(1)
+data = payload.get("data")
+raise SystemExit(0 if isinstance(data, list) else 1)
+'
 }
 
 json_success_response() {
