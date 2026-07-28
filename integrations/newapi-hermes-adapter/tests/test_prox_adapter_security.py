@@ -42,6 +42,12 @@ _ISOLATED_ENV_KEYS = (
     "HERMES_GAME_CONFIG_CACHE",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
+    "HERMES_MODEL",
+    "HERMES_INFERENCE_MODEL",
+    "HERMES_FALLBACK_MODEL",
+    "HERMES_BACKUP_MODEL",
+    "HERMES_GROUP_RETRIES",
+    "HERMES_GROUP_MAX_TOKENS",
     "IMAGE_API_BASE_URL",
     "IMAGE_OPENAI_BASE_URL",
     "IMAGE_API_KEY",
@@ -167,6 +173,104 @@ def _onebot_signature(secret, payload):
     body = json.dumps(payload).encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha1).hexdigest()
     return f"sha1={digest}"
+
+
+def test_model_empty_content_switches_to_fallback(adapter_loader, monkeypatch):
+    adapter = adapter_loader(
+        OPENAI_BASE_URL="https://models.example.test/v1",
+        OPENAI_API_KEY="model-test-key",
+        HERMES_MODEL="primary-model",
+        HERMES_FALLBACK_MODEL="fallback-model",
+        HERMES_GROUP_RETRIES="1",
+    )
+    requested_models = []
+
+    def fake_urlopen(request, timeout=0):
+        payload = json.loads(request.data)
+        requested_models.append(payload["model"])
+        if payload["model"] == "primary-model":
+            return _FakeHTTPResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "reasoning consumed the limit",
+                            },
+                        }
+                    ]
+                }
+            )
+        return _FakeHTTPResponse(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "reply": "fallback ok",
+                                    "risk": "low",
+                                    "requires_approval": False,
+                                    "actions": [],
+                                    "notes": "fallback",
+                                }
+                            )
+                        },
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+
+    result = adapter.call_model(
+        {"message_type": "group", "message": "hello"}, history=[]
+    )
+
+    assert requested_models == ["primary-model", "fallback-model"]
+    assert result["reply"] == "fallback ok"
+    assert result["notes"] == "fallback"
+
+
+def test_model_all_empty_content_returns_visible_failure(adapter_loader, monkeypatch):
+    adapter = adapter_loader(
+        OPENAI_BASE_URL="https://models.example.test/v1",
+        OPENAI_API_KEY="model-test-key",
+        HERMES_MODEL="primary-model",
+        HERMES_FALLBACK_MODEL="fallback-model",
+        HERMES_GROUP_RETRIES="1",
+    )
+    requested_models = []
+
+    def fake_urlopen(request, timeout=0):
+        payload = json.loads(request.data)
+        requested_models.append(payload["model"])
+        return _FakeHTTPResponse(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "reasoning consumed the limit",
+                        },
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+
+    result = adapter.call_model(
+        {"message_type": "group", "message": "hello"}, history=[]
+    )
+
+    assert requested_models == ["primary-model", "fallback-model"]
+    assert result["reply"]
+    assert result["notes"] == "model_unavailable"
+    assert "Hermes received non-structured output" not in result["reply"]
 
 
 def test_admin_matching_uses_only_immutable_platform_user_id(adapter_loader):

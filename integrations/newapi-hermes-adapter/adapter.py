@@ -1565,6 +1565,33 @@ def call_model(payload, history=None):
             try:
                 with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                choice = (data.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                content = str(message.get("content") or "").strip()
+                if not content:
+                    finish_reason = str(choice.get("finish_reason") or "unknown")
+                    reasoning_chars = len(str(message.get("reasoning_content") or ""))
+                    last_failure = {
+                        "status": 0,
+                        "model": model_name,
+                        "detail": "",
+                    }
+                    data = None
+                    print(
+                        f"[AI] empty content attempt={attempt + 1}/{retry_attempts} "
+                        f"model={model_name} finish_reason={finish_reason} "
+                        f"reasoning_chars={reasoning_chars}",
+                        flush=True,
+                    )
+                    if attempt < retry_attempts - 1:
+                        continue
+                    if model_index < len(ordered_models) - 1:
+                        print(
+                            f"[AI] fallback switch model={ordered_models[model_index + 1]} "
+                            "reason=empty_content",
+                            flush=True,
+                        )
+                    break
                 break
             except urllib.error.HTTPError as he:
                 last_err = he
